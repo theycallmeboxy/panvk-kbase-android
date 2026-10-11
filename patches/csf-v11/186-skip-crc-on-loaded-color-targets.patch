@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:47:06 -0400
+Subject: [PATCH] panvk: skip CRC on color targets the render pass loads
+
+A CRC-enabled render target forces its preload frame shader to ALWAYS
+mode (pan_fb.c), so a pass that loads a full-screen target reloads every
+tile even when it draws to only a few. Hades' own Vulkan renderer does
+~46 such LOAD/STORE passes per frame; PanVK shaded ~2.9x the fragments of
+the Mali DDK, nearly all of them preload threads.
+
+Don't select CRC for a color target that the pass loads from memory. Its
+CRC is invalidated like any other unselected target and the preload stays
+INTERSECT. Tiles a load pass doesn't draw to aren't written back anyway,
+so transaction elimination saves little there.
+
+Hades (Vulkan renderer), Mali-G615 MC6 pinned: 502 MHz 31.9 -> 48.2 fps
+(DDK 58.4), 1255 MHz 64.0 -> 103.1 fps (DDK 132.2). Hades through DXVK
+unchanged (99.0 / 98.5 fps at 502 MHz). 64 small LOAD passes on one
+1280x720 target: 7.6 -> 3.0 ms. PanProbe 38/38.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: skip CRC on color targets a render pass loads, so their preload stays INTERSECT instead of reloading every tile
+Upstream-commit: none (generic PanVK; upstream candidate)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none
+Validation test: Hades Vulkan renderer 31.9 -> 48.2 fps at 502 MHz (DDK 58.4), 64.0 -> 103.1 at 1255 MHz (DDK 132.2); Hades DXVK unchanged; PanProbe 38/38; no GPU faults
+Generated-by: LLM
+---
+ src/panfrost/lib/pan_fb.c               |  2 +-
+ src/panfrost/lib/pan_fb.h               |  9 +++++++++
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c | 10 ++++++++++
+ 3 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/pan_fb.c b/src/panfrost/lib/pan_fb.c
+index 8fa4cac..ba8ec28 100644
+--- a/src/panfrost/lib/pan_fb.c
++++ b/src/panfrost/lib/pan_fb.c
+@@ -662,7 +662,7 @@ pan_fb_store_target_should_crc(const struct pan_fb_layout *fb,
+                                const struct pan_fb_store_target *rt,
+                                unsigned tile_size)
+ {
+-   if (!rt->store || rt->crc_header_addr == 0 ||
++   if (!rt->store || rt->crc_header_addr == 0 || rt->no_crc ||
+        !GENX(pan_image_view_can_crc)(rt->iview, tile_size))
+       return false;
+ 
+diff --git a/src/panfrost/lib/pan_fb.h b/src/panfrost/lib/pan_fb.h
+index f9383a0..52e2197 100644
+--- a/src/panfrost/lib/pan_fb.h
++++ b/src/panfrost/lib/pan_fb.h
+@@ -410,6 +410,15 @@ struct pan_fb_store_target {
+ 
+    /** GPU address of the CRC header for this store target */
+    uint64_t crc_header_addr;
++
++   /** Don't use CRC (transaction elimination) for this target
++    *
++    * A CRC-enabled target forces its preload to ALWAYS mode, which reloads
++    * every tile even when only a few are drawn to.  Drivers can set this when
++    * the target is loaded from memory, where CRC saves little.  The CRC is
++    * then invalidated like for any other unselected target.
++    */
++   bool no_crc;
+ };
+ 
+ static inline struct pan_fb_store_target
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index deabfc7..33fcb5b 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -195,12 +195,22 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
+          att->clearValue.color.uint32[3],
+       },
+    };
++   /* Preloading a CRC-enabled target has to touch every tile (ALWAYS mode),
++    * while a pass that loads the target usually draws to only part of it and
++    * leaves the other tiles unwritten anyway. Skip CRC for such passes so the
++    * preload only runs on tiles that are drawn to.
++    */
++   const bool no_crc =
++      render->fb.load.rts[index].in_bounds_load == PAN_FB_LOAD_IMAGE;
++
+    render->fb.spill.load.rts[index] = pan_fb_load_iview(&iview->pview);
+    render->fb.spill.store.rts[index] = pan_fb_store_iview(&iview->pview);
++   render->fb.spill.store.rts[index].no_crc = no_crc;
+    panvk_fb_store_set_crc_header_addr(&render->fb.spill.store.rts[index],
+                                       iview);
+    if (att->storeOp == VK_ATTACHMENT_STORE_OP_STORE && !ms2ss) {
+       render->fb.store.rts[index] = pan_fb_store_iview(&iview->pview);
++      render->fb.store.rts[index].no_crc = no_crc;
+       panvk_fb_store_set_crc_header_addr(&render->fb.store.rts[index], iview);
+    }
+ 
+-- 
+2.55.0
+
