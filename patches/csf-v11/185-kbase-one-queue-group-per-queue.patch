@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 21:01:19 -0400
+Subject: [PATCH] panvk/kbase: use one queue group with a stream per
+ subqueue
+
+The kbase backend created a CSF queue group per subqueue. Every
+cross-subqueue wait (each render pass, each submit) can then leave a
+group idle, and waking it goes through the firmware and the kernel
+scheduler. In Hades (DXVK) on Mali-G615 the MCU was 88% busy (DDK: 32%)
+and the fragment queue idle half the frame. Create one group with
+PANVK_SUBQUEUE_COUNT streams, as the panthor path and the DDK do.
+PANVK_KBASE_ONE_GROUP=0 restores the old layout.
+
+Hades hub, GPU pinned: 502 MHz 77 -> 92 fps (DDK 87), 1255 MHz
+176 -> 205 fps (DDK 199). PanProbe 38/38, no GPU faults.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: one CSF queue group with a stream per subqueue instead of a group per subqueue (firmware/kernel round trips on every cross-subqueue wait)
+Upstream-commit: none (kbase backend only; panthor path already uses one group)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: csf/007, csf-v11/110
+Validation test: Hades hub 77 -> 92 fps at 502 MHz (DDK 87), 176 -> 205 at 1255 MHz (DDK 199); PanProbe 38/38; no GPU faults
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c | 35 ++++++++++++++++----
+ 1 file changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index 37d1fc5..dec8424 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -1053,15 +1053,31 @@ kbase_destroy_group(struct panvk_gpu_queue *queue)
+       pan_kmod_bo_put(subq->kbase.ringbuf_bo);
+       subq->kbase.ringbuf_bo = NULL;
+       subq->kbase.user_io = NULL;
++   }
++
++   /* Subqueues may share one group: destroy each group once, after all of
++    * its queues are terminated. */
++   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
++      uint32_t handle = queue->subqueues[i].kbase.group_handle;
+ 
+-      if (subq->kbase.group_handle != UINT32_MAX) {
+-         kbase_kmod_csf_group_destroy(dev->kmod.dev,
+-                                      subq->kbase.group_handle);
+-         subq->kbase.group_handle = UINT32_MAX;
++      if (handle == UINT32_MAX)
++         continue;
++
++      kbase_kmod_csf_group_destroy(dev->kmod.dev, handle);
++      for (uint32_t j = i; j < PANVK_SUBQUEUE_COUNT; j++) {
++         if (queue->subqueues[j].kbase.group_handle == handle)
++            queue->subqueues[j].kbase.group_handle = UINT32_MAX;
+       }
+    }
+ }
+ 
++/* One CSG with a CS per subqueue, like the panthor path and the Mali blob.
++ * With a group per subqueue, every cross-subqueue wait (each render pass,
++ * each submit) can leave a group idle; waking it again goes through the
++ * firmware and the kernel scheduler.  PANVK_KBASE_ONE_GROUP=0 restores the
++ * group-per-subqueue layout. */
++DEBUG_GET_ONCE_BOOL_OPTION(kbase_one_group, "PANVK_KBASE_ONE_GROUP", true)
++
+ static VkResult
+ kbase_create_group(struct panvk_gpu_queue *queue)
+ {
+@@ -1073,11 +1089,16 @@ kbase_create_group(struct panvk_gpu_queue *queue)
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+       queue->subqueues[i].kbase.group_handle = UINT32_MAX;
+ 
++   const bool one_group = debug_get_option_kbase_one_group();
++
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+       struct panvk_subqueue *subq = &queue->subqueues[i];
+ 
+-      if (kbase_kmod_csf_group_create(dev->kmod.dev, 1,
+-                                      &subq->kbase.group_handle)) {
++      if (one_group && i > 0) {
++         subq->kbase.group_handle = queue->subqueues[0].kbase.group_handle;
++      } else if (kbase_kmod_csf_group_create(
++                    dev->kmod.dev, one_group ? PANVK_SUBQUEUE_COUNT : 1,
++                    &subq->kbase.group_handle)) {
+          result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                                "Failed to create a kbase queue group");
+          goto err_destroy_group;
+@@ -1127,7 +1148,7 @@ kbase_create_group(struct panvk_gpu_queue *queue)
+       }
+ 
+       subq->kbase.user_io = kbase_kmod_csf_queue_bind(
+-         dev->kmod.dev, subq->kbase.group_handle, 0,
++         dev->kmod.dev, subq->kbase.group_handle, one_group ? i : 0,
+          subq->kbase.ringbuf_dev,
+          KBASE_RINGBUF_SIZE);
+       if (!subq->kbase.user_io) {
+-- 
+2.55.0
+
