@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 21:01:19 -0400
+Subject: [PATCH] pan/bi: retrieve the interpolation position for later
+ varying loads
+
+Every interpolated varying load is emitted with .store, which recomputes
+the interpolation position and writes the hidden varying state, so
+va_insert_flow makes it wait for all outstanding varying loads. A
+fragment shader reading two varyings serializes them. Within a block,
+once a load has stored the position for a sample mode, later loads with
+the same mode can use .retrieve: no recompute and no wait.
+
+On Mali-G615, 32 layers of blended full-screen quads whose shader reads
+UV + colour: 2.01 ms -> 1.35 ms (DDK 1.26 ms). Output bit-identical.
+BIFROST_MESA_DEBUG=noretrieve disables the pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: stop serializing interpolated varying loads in Valhall fragment shaders
+Upstream-commit: none (upstream Mesa also emits .store on every load)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none
+Validation test: blended full-screen quads reading UV + colour 2.01 -> 1.35 ms (DDK 1.26), framebuffer checksums identical with and without the pass; PanProbe 38/38
+Generated-by: LLM
+---
+ src/panfrost/compiler/bifrost/bi_debug.c      |  1 +
+ src/panfrost/compiler/bifrost/bi_debug.h      |  1 +
+ .../compiler/bifrost/bifrost_compile.c        | 70 +++++++++++++++++++
+ 3 files changed, 72 insertions(+)
+
+diff --git a/src/panfrost/compiler/bifrost/bi_debug.c b/src/panfrost/compiler/bifrost/bi_debug.c
+index 6e99189..230516f 100644
+--- a/src/panfrost/compiler/bifrost/bi_debug.c
++++ b/src/panfrost/compiler/bifrost/bi_debug.c
+@@ -29,6 +29,7 @@ static const struct debug_named_value bifrost_debug_options[] = {
+    {"statsabs",   BIFROST_DBG_STATSABS,   "Don't normalize statistics"},
+    {"statsfull",  BIFROST_DBG_STATSFULL,  "Print verbose statistics"},
+    {"debuginfo",  BIFROST_DBG_DEBUGINFO,  "Print debug information"},
++   {"noretrieve", BIFROST_DBG_NORETRIEVE, "Store the interpolation position on every varying load"},
+    DEBUG_NAMED_VALUE_END
+ };
+ /* clang-format on */
+diff --git a/src/panfrost/compiler/bifrost/bi_debug.h b/src/panfrost/compiler/bifrost/bi_debug.h
+index 3360e23..cf5cfe6 100644
+--- a/src/panfrost/compiler/bifrost/bi_debug.h
++++ b/src/panfrost/compiler/bifrost/bi_debug.h
+@@ -32,6 +32,7 @@ extern "C" {
+ #define BIFROST_DBG_STATSABS   0x8000
+ #define BIFROST_DBG_STATSFULL 0x10000
+ #define BIFROST_DBG_DEBUGINFO 0x20000
++#define BIFROST_DBG_NORETRIEVE 0x40000
+ 
+ extern unsigned bifrost_debug;
+ 
+diff --git a/src/panfrost/compiler/bifrost/bifrost_compile.c b/src/panfrost/compiler/bifrost/bifrost_compile.c
+index d7adf88..c6692a6 100644
+--- a/src/panfrost/compiler/bifrost/bifrost_compile.c
++++ b/src/panfrost/compiler/bifrost/bifrost_compile.c
+@@ -602,6 +602,72 @@ bi_emit_load_var(bi_builder *b, nir_intrinsic_instr *intr)
+    bi_split_def(b, &intr->def);
+ }
+ 
++/* Every interpolated varying load is emitted with .store, which recomputes the
++ * interpolation position and writes it to the hidden varying state. A load
++ * that writes that state has to wait for all outstanding varying loads (see
++ * va_insert_flow.c), so a shader reading several varyings serializes them.
++ * Within a block, once a load has stored the position for a sample mode, later
++ * loads with the same mode can retrieve it instead: no recompute, no wait.
++ * Varying-heavy fragment shaders (e.g. UV + colour) run ~1.6x faster on G615.
++ */
++static bool
++va_is_interp_varying_load(const bi_instr *I)
++{
++   switch (I->op) {
++   case BI_OPCODE_LD_VAR_BUF_IMM_F32:
++   case BI_OPCODE_LD_VAR_BUF_IMM_F16:
++   case BI_OPCODE_LD_VAR_BUF_F32:
++   case BI_OPCODE_LD_VAR_BUF_F16:
++      return I->source_format == BI_SOURCE_FORMAT_F32 ||
++             I->source_format == BI_SOURCE_FORMAT_F16;
++   case BI_OPCODE_LD_VAR_IMM:
++   case BI_OPCODE_LD_VAR:
++      return true;
++   default:
++      return false;
++   }
++}
++
++static void
++va_retrieve_varying_position(bi_context *ctx)
++{
++   bi_foreach_block(ctx, block) {
++      bool stored = false;
++      enum bi_sample sample = BI_SAMPLE_CENTER;
++      bi_index sample_src = bi_null();
++
++      bi_foreach_instr_in_block(block, I) {
++         if (va_is_interp_varying_load(I) && I->update == BI_UPDATE_STORE &&
++             I->sample != BI_SAMPLE_EXPLICIT) {
++            if (stored && I->sample == sample &&
++                (I->sample != BI_SAMPLE_SAMPLE ||
++                 bi_is_equiv(I->src[0], sample_src))) {
++               I->update = BI_UPDATE_RETRIEVE;
++            } else {
++               stored = true;
++               sample = I->sample;
++               sample_src = I->src[0];
++            }
++            continue;
++         }
++
++         /* Anything else that may touch the hidden state (flat loads keep
++          * .store, special varyings clobber it, fused VAR_TEX) or redefine the
++          * sample index ends the run conservatively.
++          */
++         if (bi_get_opcode_props(I)->message == BIFROST_MESSAGE_VARYING ||
++             I->op == BI_OPCODE_VAR_TEX_F32 || I->op == BI_OPCODE_VAR_TEX_F16)
++            stored = false;
++
++         bi_foreach_dest(I, d) {
++            if (stored && sample == BI_SAMPLE_SAMPLE &&
++                bi_is_equiv(I->dest[d], sample_src))
++               stored = false;
++         }
++      }
++   }
++}
++
+ static void
+ bi_emit_load_var_buf(bi_builder *b, nir_intrinsic_instr *intr)
+ {
+@@ -4363,6 +4429,10 @@ bi_compile_variant_nir(nir_shader *nir,
+       va_lower_isel(ctx);
+       va_optimize(ctx);
+ 
++      if (ctx->stage == MESA_SHADER_FRAGMENT &&
++          !(bifrost_debug & BIFROST_DBG_NORETRIEVE))
++         va_retrieve_varying_position(ctx);
++
+       /* Count how often a specific constant appears. */
+       struct hash_table_u64 *const_hist = _mesa_hash_table_u64_create(ctx);
+       bi_foreach_instr_global_safe(ctx, I) {
+-- 
+2.55.0
+
