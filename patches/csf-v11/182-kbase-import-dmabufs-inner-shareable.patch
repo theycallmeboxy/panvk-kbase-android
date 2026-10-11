@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 21:01:04 -0400
+Subject: [PATCH] panfrost/kbase: import dma-bufs inner-shareable
+
+Imported dma-bufs were mapped outer-shareable (BASE_MEM_COHERENT_SYSTEM).
+The same buffers are mapped inner-shareable by the vendor driver in other
+GPU clients (SurfaceFlinger, the app's compositor), so the GPU saw one
+physical page with conflicting shareability: intermittent
+GPU_SHAREABILITY_FAULT (0x88) and a full GPU reset on MT6897 (Mali-G615).
+Use BASE_MEM_COHERENT_LOCAL, as the DDK does.
+
+Tested: PanProbe 38/38 x3; Hades faults 8/8 launches before, 0/7 after;
+Moonlighter 5/5 before, 0/6 after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: fix intermittent GPU_SHAREABILITY_FAULT + GPU reset when importing dma-bufs shared with vendor-driver clients
+Upstream-commit: none (kbase backend only)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: kbase-common/files (kbase_kmod.c), csf-v11/110
+Validation test: PanProbe 38/38 x3; Hades 0/7 launches faulting (8/8 before); Moonlighter 0/6 (5/5 before)
+Generated-by: LLM
+---
+ src/panfrost/lib/kmod/kbase_kmod.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index bb7eaee..a2b9f94 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -1879,10 +1879,17 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
+       goto err_free_bo;
+    }
+ 
++   /* Import dma-bufs inner-shareable (COHERENT_LOCAL), like the vendor DDK.
++    * The same buffers are mapped by other GPU clients (SurfaceFlinger, the
++    * app's compositor) through the vendor driver with inner shareability;
++    * mapping them outer-shareable (COHERENT_SYSTEM) here makes the GPU see one
++    * physical page with conflicting shareability, which raises an
++    * intermittent GPU_SHAREABILITY_FAULT (0x88) and a full GPU reset on
++    * MT6897 (ACE-Lite). */
+    uint64_t import_flags =
+       BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR |
+       BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+-      BASE_MEM_IMPORT_SHARED | BASE_MEM_COHERENT_SYSTEM;
++      BASE_MEM_IMPORT_SHARED | BASE_MEM_COHERENT_LOCAL;
+ 
+    if (kmod_flags & PAN_KMOD_BO_FLAG_GPU_UNCACHED)
+       import_flags |= BASE_MEM_UNCACHED_GPU;
+-- 
+2.55.0
+
