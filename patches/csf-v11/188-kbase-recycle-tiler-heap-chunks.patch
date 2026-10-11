@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 16:20:15 -0400
+Subject: [PATCH] panvk/kbase: recycle tiler heap chunks instead of renewing
+ the heap
+
+The kbase backend skipped the tiler heap operations (vt_end,
+FINISH_FRAGMENT) and replaced the whole heap every 128 submissions or
+65536 units of estimated tiler work. Between renewals the heap only grew,
+through firmware/kernel out-of-memory round trips: on a Mali-G615 MC6 a
+frame of 8000 small draws saw ~52 GPU MMU flushes and 26 interrupts, and
+the old heap was torn down (unmap + MMU flush) inside vkQueueSubmit.
+
+Emit the heap operations on kbase too, so the firmware returns chunks
+after each render pass, and stop renewing the heap: renewing it while the
+firmware recycles chunks hangs the queue. PANVK_KBASE_NO_HEAP_OPS=1
+restores the old scheme.
+
+drawbench at default clocks (ms/frame, Mali DDK in brackets): 2000 draws
+1.3 -> 0.35 (0.38), 8000 draws 5.5 -> 1.10 (1.49), 40000 draws 33.5 ->
+4.95 (8.08); framebuffer checksums identical to the DDK across 12 tests.
+Hades (DXVK and Vulkan renderer) and Serious Sam Fusion unchanged; PanProbe
+as before. Tiler heap during 8000-draw frames: constant 51 MiB instead of 82-122 MiB
+(peak 138 MiB). No 'Invalid Heap statistics' from kbase with clear-only
+render passes mixed in while the heap grows (60 s, up to ~50k draws per
+frame).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: recycle tiler heap chunks on kbase (emit vt_end/FINISH_FRAGMENT heap ops) instead of renewing the heap every 128 submissions; renewal off when heap ops are on
+Upstream-commit: none (kbase backend only)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: csf-v11/110 (kbase backend); replaces the heap-op skip it introduced
+Validation test: drawbench 8000 draws 5.5 -> 1.10 ms (DDK 1.49), 40000 draws 33.5 -> 4.95 ms (DDK 8.08), checksums identical to the DDK on 12 tests; clear-only passes + heap growth 60 s without kbase heap-statistics errors; Hades and Serious Sam unchanged; no GPU faults
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h   | 15 +++++++++++++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c  | 13 +++++++------
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c |  4 +++-
+ 3 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index b3162fc..b6f6796 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -25,6 +25,21 @@
+ #include "vk_synchronization.h"
+ 
+ #include "util/list.h"
++#include "util/u_debug.h"
++
++/* kbase: emit the tiler heap operations (vt_end, FINISH_FRAGMENT) so the
++ * firmware recycles heap chunks, instead of renewing the whole heap every
++ * so often. PANVK_KBASE_NO_HEAP_OPS=1 restores the renewal scheme. */
++static inline bool
++panvk_kbase_heap_ops(void)
++{
++   static int enabled = -1;
++
++   if (enabled < 0)
++      enabled = !debug_get_bool_option("PANVK_KBASE_NO_HEAP_OPS", false);
++
++   return enabled;
++}
+ #include "util/perf/u_trace.h"
+ 
+ struct panvk_sync_scope {
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index eb8e129..4e65eb1 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -56,18 +56,19 @@
+ 
+ /* kbase validates the firmware heap statistics on every tiler OOM event and
+  * terminates the queue group when frag_end > vt_end ("Invalid Heap
+- * statistics provided by firmware"), which surfaces as DEVICE_LOST.  On
+- * kbase, emit only VERTEX_TILER_STARTED: vt_end and frag_end then stay 0,
+- * nr_in_flight = vt_start keeps the grow path valid, and the heap is
+- * recycled wholesale by the queue's heap renewal instead of
+- * FINISH_FRAGMENT/FRAGMENT_COMPLETED. */
++ * statistics provided by firmware").  With PANVK_KBASE_NO_HEAP_OPS=1, emit
++ * only VERTEX_TILER_STARTED: vt_end and frag_end then stay 0, nr_in_flight =
++ * vt_start keeps the grow path valid, and the heap is recycled wholesale by
++ * the queue's heap renewal instead of FINISH_FRAGMENT/FRAGMENT_COMPLETED.
++ * The full heap operations must not be mixed with heap renewal (the queue
++ * then hangs), see panvk_kbase_heap_ops(). */
+ static bool
+ cmdbuf_skips_gpu_heap_ops(const struct panvk_cmd_buffer *cmdbuf)
+ {
+    const struct panvk_physical_device *phys_dev =
+       to_panvk_physical_device(cmdbuf->vk.base.device->physical);
+ 
+-   return phys_dev->kbase_node_path[0] != '\0';
++   return phys_dev->kbase_node_path[0] != '\0' && !panvk_kbase_heap_ops();
+ }
+ 
+ static bool
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index dec8424..4c88905 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -3021,8 +3021,10 @@ panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
+          queue->kbase_tiler_work_count += submit->tiler_work_estimate;
+    }
+ 
++   /* With heap operations the firmware recycles chunks, and renewing the
++    * heap under it hangs the queue. */
+    uint64_t renew_work = kbase_tiler_heap_renew_work();
+-   if (submit->tiler_work_estimate &&
++   if (!panvk_kbase_heap_ops() && submit->tiler_work_estimate &&
+        (queue->kbase_tiler_submit_count >=
+            kbase_tiler_heap_renew_interval() ||
+         (renew_work && queue->kbase_tiler_work_count >= renew_work))) {
+-- 
+2.55.0
+
