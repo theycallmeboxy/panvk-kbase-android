@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 21:10:08 -0400
-Subject: [PATCH 2/3] panvk/csf: elide redundant barrier syncs and idle compute
+Subject: [PATCH] panvk/csf: elide redundant barrier syncs and idle compute
  subqueue work
 
 Graphics barriers (render pass dependencies, layout transitions, most
@@ -41,9 +41,9 @@ Generated-by: LLM
 ---
  src/panfrost/genxml/cs_builder.h              |   6 +
  src/panfrost/vulkan/csf/panvk_cmd_buffer.h    |  43 ++
- src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 381 +++++++++++++++---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 379 +++++++++++++++---
  src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   |   6 +-
- 4 files changed, 382 insertions(+), 54 deletions(-)
+ 4 files changed, 378 insertions(+), 56 deletions(-)
 
 diff --git a/src/panfrost/genxml/cs_builder.h b/src/panfrost/genxml/cs_builder.h
 index 93201b5..cfd839c 100644
@@ -70,7 +70,7 @@ index 93201b5..cfd839c 100644
        return util_dynarray_grow(&b->blocks.instrs, uint64_t, num_instrs);
  
 diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
-index b6f6796..1c95e96 100644
+index 451777c..cb4a93c 100644
 --- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
 +++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
 @@ -298,6 +298,12 @@ struct panvk_cs_deps {
@@ -141,18 +141,13 @@ index b6f6796..1c95e96 100644
  }
  
 diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
-index b47583f..e6f3acd 100644
+index b47583f..ad721b8 100644
 --- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
 +++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
-@@ -150,6 +150,23 @@ emit_tls(struct panvk_cmd_buffer *cmdbuf)
-  * Write all sync point updates to seqno registers and reset the relative sync
-  * points to 0.
-  */
-+static void emit_cache_flush(struct cs_builder *b,
-+                             struct panvk_cmd_buffer *cmdbuf,
-+                             enum panvk_subqueue_id i,
-+                             const struct panvk_cache_flush_info *cache_flush);
-+
+@@ -146,6 +146,42 @@ emit_tls(struct panvk_cmd_buffer *cmdbuf)
+    }
+ }
+ 
 +/* Barrier sync elision (emit_barrier_csf()), primary command buffers only. */
 +static bool
 +sync_elision_enabled(const struct panvk_cmd_buffer *cmdbuf)
@@ -165,10 +160,34 @@ index b47583f..e6f3acd 100644
 +   return !disabled && cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 +}
 +
- static void
- flush_sync_points(struct panvk_cmd_buffer *cmdbuf)
- {
-@@ -175,8 +192,18 @@ flush_sync_points(struct panvk_cmd_buffer *cmdbuf)
++static void
++emit_cache_flush(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
++                 enum panvk_subqueue_id i,
++                 const struct panvk_cache_flush_info *cache_flush)
++{
++   struct cs_index flush_id = cs_scratch_reg32(b, 0);
++
++   panvk_per_arch(panvk_instr_begin_work)(i, cmdbuf,
++                                          PANVK_INSTR_WORK_TYPE_FLUSH_CACHE);
++   cs_move32_to(b, flush_id, 0);
++   cs_flush_caches(b, cache_flush->l2, cache_flush->lsc, cache_flush->others,
++                   flush_id, cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
++   cs_wait_slot(b, SB_ID(IMM_FLUSH));
++   struct panvk_instr_end_args instr_info_flush = {
++      .flush_cache = {
++         .l2 = cache_flush->l2,
++         .lsc = cache_flush->lsc,
++         .other = cache_flush->others,
++      }};
++   panvk_per_arch(panvk_instr_end_work)(i, cmdbuf,
++                                        PANVK_INSTR_WORK_TYPE_FLUSH_CACHE,
++                                        &instr_info_flush);
++}
++
+ /**
+  * Write all sync point updates to seqno registers and reset the relative sync
+  * points to 0.
+@@ -175,8 +211,18 @@ flush_sync_points(struct panvk_cmd_buffer *cmdbuf)
        }
     }
  
@@ -189,7 +208,7 @@ index b47583f..e6f3acd 100644
  }
  
  static void
-@@ -329,6 +356,26 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+@@ -329,6 +375,26 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
  
     panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
  
@@ -216,7 +235,7 @@ index b47583f..e6f3acd 100644
     /* Finishing queries requires a barrier. We don't want to do that more
      * often than necessary. At the end of a primary is usually enough.
      * Additionally, simultaneous use secondaries also need to flush if they
-@@ -548,9 +595,12 @@ collect_cs_deps(struct panvk_cmd_buffer *cmdbuf, const VkDependencyInfo *info,
+@@ -548,9 +614,12 @@ collect_cs_deps(struct panvk_cmd_buffer *cmdbuf, const VkDependencyInfo *info,
  
     /* A vertex/tiler wait on fragment work can be deferred when the
      * vertex/tiler side of the second scope is only pre-rasterization shader
@@ -231,7 +250,7 @@ index b47583f..e6f3acd 100644
        const VkPipelineStageFlags2 lazy_ok =
           VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
           VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
-@@ -685,26 +735,120 @@ panvk_per_arch(add_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
+@@ -685,26 +754,96 @@ panvk_per_arch(add_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
     }
  }
  
@@ -276,30 +295,6 @@ index b47583f..e6f3acd 100644
 +{
 +   return !(flush->l2 & ~done->l2) && !(flush->lsc & ~done->lsc) &&
 +          !(flush->others & ~done->others);
-+}
-+
-+static void
-+emit_cache_flush(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
-+                 enum panvk_subqueue_id i,
-+                 const struct panvk_cache_flush_info *cache_flush)
-+{
-+   struct cs_index flush_id = cs_scratch_reg32(b, 0);
-+
-+   panvk_per_arch(panvk_instr_begin_work)(i, cmdbuf,
-+                                          PANVK_INSTR_WORK_TYPE_FLUSH_CACHE);
-+   cs_move32_to(b, flush_id, 0);
-+   cs_flush_caches(b, cache_flush->l2, cache_flush->lsc, cache_flush->others,
-+                   flush_id, cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
-+   cs_wait_slot(b, SB_ID(IMM_FLUSH));
-+   struct panvk_instr_end_args instr_info_flush = {
-+      .flush_cache = {
-+         .l2 = cache_flush->l2,
-+         .lsc = cache_flush->lsc,
-+         .other = cache_flush->others,
-+      }};
-+   panvk_per_arch(panvk_instr_end_work)(i, cmdbuf,
-+                                        PANVK_INSTR_WORK_TYPE_FLUSH_CACHE,
-+                                        &instr_info_flush);
 +}
 +
 +/* Emit the waits and cache flushes an idle compute subqueue deferred
@@ -364,7 +359,7 @@ index b47583f..e6f3acd 100644
     }
  }
  
-@@ -722,6 +866,51 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+@@ -722,6 +861,51 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
           panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
     }
  
@@ -416,19 +411,28 @@ index b47583f..e6f3acd 100644
     uint32_t wait_subqueue_mask = 0;
     uint32_t utrace_subqueue_mask = 0;
     for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
-@@ -750,39 +939,56 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+@@ -742,47 +926,63 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+    static int no_lazy = -1;
+    if (no_lazy < 0)
+       no_lazy = debug_get_bool_option("PANVK_NO_LAZY_VT_WAIT", false);
+-   const bool lazy_vt =
++   const bool vt_may_defer =
+       !no_lazy && !deps.vt_frag_wait_now &&
+       cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+-      !deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].conditional &&
++      !deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].conditional;
++   const bool lazy_vt =
++      vt_may_defer &&
+       (deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask & frag_bit);
     if (lazy_vt)
        deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask &= ~frag_bit;
  
 +   /* A fragment wait the vertex/tiler subqueue inherits from an idle compute
 +    * subqueue can be deferred the same way. */
 +   int32_t vt_lazy_inherited = 0;
-+   if (cq_skip && cq_waits[PANVK_SUBQUEUE_FRAGMENT] &&
++   if (vt_may_defer && cq_skip && cq_waits[PANVK_SUBQUEUE_FRAGMENT] &&
 +       (deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask &
-+        BITFIELD_BIT(cq)) &&
-+       !no_lazy && !deps.vt_frag_wait_now &&
-+       cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
-+       !deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].conditional)
++        BITFIELD_BIT(cq)))
 +      vt_lazy_inherited = cq_waits[PANVK_SUBQUEUE_FRAGMENT];
 +
     u_foreach_bit(i, utrace_subqueue_mask)
@@ -493,7 +497,7 @@ index b47583f..e6f3acd 100644
           struct cs_index sync_addr = cs_scratch_reg64(b, 0);
           struct cs_index add_val = cs_scratch_reg64(b, 2);
  
-@@ -799,25 +1005,80 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+@@ -799,25 +999,80 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
        }
     }
  
@@ -580,7 +584,7 @@ index b47583f..e6f3acd 100644
        }
     }
  
-@@ -891,17 +1152,10 @@ panvk_per_arch(cmd_flush_lazy_vt_wait)(struct panvk_cmd_buffer *cmdbuf)
+@@ -891,17 +1146,10 @@ panvk_per_arch(cmd_flush_lazy_vt_wait)(struct panvk_cmd_buffer *cmdbuf)
  
     struct cs_builder *b =
        panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
@@ -601,7 +605,7 @@ index b47583f..e6f3acd 100644
  }
  
  VKAPI_ATTR void VKAPI_CALL
-@@ -912,6 +1166,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+@@ -912,6 +1160,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     struct panvk_cs_deps deps = {0};
  
     panvk_per_arch(add_cs_deps)(cmdbuf, pDependencyInfo, &deps, false);
@@ -609,7 +613,7 @@ index b47583f..e6f3acd 100644
  
     if (deps.needs_fb_barrier)
        panvk_per_arch(cmd_fb_barrier)(cmdbuf);
-@@ -1240,6 +1495,28 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
+@@ -1240,6 +1489,28 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
        panvk_per_arch(panvk_instr_begin_work)(i, cmdbuf,
                                               PANVK_INSTR_WORK_TYPE_CMDBUF);
  

@@ -42,15 +42,16 @@ Generated-by: LLM
  3 files changed, 25 insertions(+), 7 deletions(-)
 
 diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
-index b3162fc..b6f6796 100644
+index de7a09a..451777c 100644
 --- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
 +++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
-@@ -25,6 +25,21 @@
+@@ -25,8 +25,23 @@
  #include "vk_synchronization.h"
  
  #include "util/list.h"
 +#include "util/u_debug.h"
-+
+ #include "util/perf/u_trace.h"
+ 
 +/* kbase: emit the tiler heap operations (vt_end, FINISH_FRAGMENT) so the
 + * firmware recycles heap chunks, instead of renewing the whole heap every
 + * so often. PANVK_KBASE_NO_HEAP_OPS=1 restores the renewal scheme. */
@@ -64,9 +65,10 @@ index b3162fc..b6f6796 100644
 +
 +   return enabled;
 +}
- #include "util/perf/u_trace.h"
- 
++
  struct panvk_sync_scope {
+    VkPipelineStageFlags2 stages;
+    VkAccessFlags2 access;
 diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
 index eb8e129..4e65eb1 100644
 --- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c

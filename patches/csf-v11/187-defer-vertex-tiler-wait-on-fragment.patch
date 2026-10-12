@@ -33,17 +33,17 @@ Dependencies: none
 Validation test: Hades Vulkan renderer 48.3 -> 54.7 fps at 502 MHz (DDK 58.4), 103.1 -> 123.9 at 1255 MHz (DDK 132.2); Hades DXVK unchanged; PanProbe 38/38; no GPU faults
 Generated-by: LLM
 ---
- src/panfrost/vulkan/csf/panvk_cmd_buffer.h    | 15 ++++
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h    | 14 ++++
  src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 80 +++++++++++++++++++
  src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   |  8 ++
  src/panfrost/vulkan/csf/panvk_vX_cmd_event.c  |  6 ++
  src/panfrost/vulkan/csf/panvk_vX_cmd_query.c  | 10 +++
  src/panfrost/vulkan/panvk_shader.h            |  2 +
  src/panfrost/vulkan/panvk_vX_shader.c         | 33 ++++++++
- 7 files changed, 154 insertions(+)
+ 7 files changed, 153 insertions(+)
 
 diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
-index bdc295e..b3162fc 100644
+index bdc295e..de7a09a 100644
 --- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
 +++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
 @@ -282,6 +282,11 @@ struct panvk_cs_deps {
@@ -72,12 +72,11 @@ index bdc295e..b3162fc 100644
     struct cs_tracing_ctx tracing;
  };
  
-@@ -913,6 +925,9 @@ void panvk_per_arch(add_cs_deps)(
+@@ -913,6 +925,8 @@ void panvk_per_arch(add_cs_deps)(
     struct panvk_cs_deps *out,
     bool is_set_event);
  
 +void panvk_per_arch(cmd_flush_lazy_vt_wait)(struct panvk_cmd_buffer *cmdbuf);
-+
 +
  VkResult panvk_per_arch(cmd_prepare_exec_cmd_for_draws)(
     struct panvk_cmd_buffer *primary, struct panvk_cmd_buffer *secondary,
@@ -235,27 +234,27 @@ index 1733fa3..eb8e129 100644
        raster_vs_variant(cmdbuf, draw->gpu_prerast_generated);
     const struct panvk_shader_variant *fs =
 diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
-index 511be87..2331926 100644
+index 511be87..c648beb 100644
 --- a/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
 +++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
-@@ -16,6 +16,8 @@ panvk_per_arch(CmdResetEvent2)(VkCommandBuffer commandBuffer, VkEvent _event,
-                                VkPipelineStageFlags2 stageMask)
- {
+@@ -18,6 +18,8 @@ panvk_per_arch(CmdResetEvent2)(VkCommandBuffer commandBuffer, VkEvent _event,
     VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
-+
-+   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
     VK_FROM_HANDLE(panvk_event, event, _event);
  
-    /* Wrap stageMask with a VkDependencyInfo object so we can re-use
-@@ -91,6 +93,8 @@ panvk_per_arch(CmdSetEvent2)(VkCommandBuffer commandBuffer, VkEvent _event,
-                              const VkDependencyInfo *pDependencyInfo)
- {
-    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
-+
 +   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
++
+    /* Wrap stageMask with a VkDependencyInfo object so we can re-use
+     * add_cs_deps(). */
+    const VkMemoryBarrier2 barrier = {
+@@ -94,6 +96,8 @@ panvk_per_arch(CmdSetEvent2)(VkCommandBuffer commandBuffer, VkEvent _event,
     VK_FROM_HANDLE(panvk_event, event, _event);
     struct panvk_cs_deps deps = {0};
  
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
++
+    panvk_per_arch(add_cs_deps)(cmdbuf, pDependencyInfo, &deps, true);
+ 
+    /* vkCmdSetEvents() is not allowed to be called mid-render-pass */
 @@ -260,6 +264,8 @@ panvk_per_arch(CmdWaitEvents2)(VkCommandBuffer commandBuffer,
  {
     VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
@@ -266,54 +265,54 @@ index 511be87..2331926 100644
        VK_FROM_HANDLE(panvk_event, event, pEvents[i]);
        const VkDependencyInfo *info = &pDependencyInfos[i];
 diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
-index 15d15b3..d99e151 100644
+index 15d15b3..d95ab58 100644
 --- a/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
 +++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
-@@ -1222,6 +1222,8 @@ panvk_per_arch(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
-                                   uint32_t queryCount)
- {
+@@ -1224,6 +1224,8 @@ panvk_per_arch(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
-+
-+   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
     VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
  
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
     if (queryCount == 0)
-@@ -1251,6 +1253,8 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
-                                         uint32_t index)
- {
+       return;
+ 
+@@ -1253,6 +1255,8 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
-+
-+   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
     VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
  
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
     assert(index == 0 ||
-@@ -1284,6 +1288,8 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
-                                       uint32_t index)
- {
+           pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT);
+ 
+@@ -1286,6 +1290,8 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
-+
-+   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
     VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
  
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
     assert(index == 0 ||
-@@ -1317,6 +1323,8 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
-                                    VkQueryPool queryPool, uint32_t query)
- {
+           pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT);
+ 
+@@ -1319,6 +1325,8 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
-+
-+   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
     VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
  
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
     panvk_cmd_write_timestamp_query(cmd, stage, pool, query);
-@@ -1329,6 +1337,8 @@ panvk_per_arch(CmdCopyQueryPoolResults)(
-    VkDeviceSize stride, VkQueryResultFlags flags)
- {
-    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
-+
-+   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
+ }
+ 
+@@ -1332,6 +1340,8 @@ panvk_per_arch(CmdCopyQueryPoolResults)(
     VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
     VK_FROM_HANDLE(panvk_buffer, dst_buffer, dstBuffer);
  
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
+    uint64_t dst_buffer_addr = panvk_buffer_gpu_ptr(dst_buffer, dstOffset);
+ 
+    switch (pool->vk.query_type) {
 diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
 index bf2904f..0df6145 100644
 --- a/src/panfrost/vulkan/panvk_shader.h
