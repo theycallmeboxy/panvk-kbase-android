@@ -1,0 +1,420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 14:58:42 -0400
+Subject: [PATCH] pan/kmod: cap GPU memory at what a game can actually get
+
+The kernel's OOM handling can't get GPU memory back in time: GPU pages
+can't be swapped, and kbase only returns a process's GPU pages when its
+GPU context is torn down at exit. When a process allocates GPU memory
+until the system runs out, killing it frees nothing quickly, and the OOM
+killer works through the rest of the system until the kernel panics. A
+game reached ~9 GB of GPU memory on an 8 GB device this way; files
+written shortly before the panic were lost.
+
+Guard against it so that an out-of-memory situation ends in this process
+rather than in the system:
+
+ - cap this process's GPU buffers at what a game can actually get: RAM
+   minus RAM/8 (clamped to [768 MiB, 2 GiB]) and 2.5 GiB for the OS and
+   the game's CPU side, at least 4 GiB or half the RAM if less, at most
+   75% of the RAM (8 GB: 4.2 GiB, 12 GB: 7.5 GiB, 16 GB: 10.9 GiB).
+   PAN_MEM_LIMIT_MB overrides it, 0 disables the guard;
+ - also refuse allocations while MemAvailable is below twice the
+   critical level and swap can't make room (less than 1/8 of it free, or
+   none). A game's CPU side normally gets swapped out when memory is
+   low, so low MemAvailable alone is no reason to refuse;
+ - if MemAvailable drops below the critical level (RAM/24 clamped to
+   [256, 768] MiB) while this process holds more than that in GPU
+   buffers, log what it holds and kill the process, which frees its GPU
+   memory on exit.
+
+Refused allocations fail with VK_ERROR_OUT_OF_DEVICE_MEMORY and log the
+request, the process's holdings by size class, MemAvailable and
+SwapFree. /proc/meminfo is read once per 64 MiB of new allocations, and
+on every allocation while memory is low. Imported buffers aren't counted.
+
+The GPU shares RAM with everything else, and engines size their pools
+from the heap size as if it were dedicated VRAM, so unless
+heap_memory_percent is set PanVK reports the same limit as its heap size
+(instead of 75% of RAM), and VK_EXT_memory_budget reports what the
+process may still allocate under it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: stop a runaway GPU allocator from exhausting system memory (GPU pages can't be swapped and kbase frees them only at context teardown, so the kernel OOM killer cannot recover them and the kernel panics): cap each process's GPU memory at what a game can actually get (RAM-scaled, also reported as the heap size), refuse when memory is low and swap is full, and have a process still holding GPU memory at a critical MemAvailable log and kill itself
+Upstream-commit: none (generic pan_kmod + PanVK heap size; upstream candidate)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11, 8 GB)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: csf-v11/085
+Validation test: 8 GB: limit/heap 4284 MiB, critical 325 MiB. memhog: refused at 4234 MiB held with 2 GB free (retries refused); with PAN_MEM_LIMIT_MB=7000 grows to 6154 MiB while swap absorbs pressure, then logs and SIGKILLs itself at MemAvailable 320 MiB, no lmkd kills. Games (GameNative, PanVK): Valheim 2.05 GB GPU, MemAvailable min 623 MiB, no refusals, 57 fps; Megabonk 60 fps; Jupiter Hell (previously panicked the kernel at ~9 GB) has its 3.6 GB request refused and reaches its loading screen; Descenders refused at 4.08 GB and exits (stock driver reached 5.3 GB with 295 MiB free); racetest all cases 0/100 stale, controls 100/100; drawbench image checksums identical to csf-v11/192 (8 tests)
+Generated-by: LLM
+---
+ src/panfrost/lib/kmod/pan_kmod.c            | 216 ++++++++++++++++++++
+ src/panfrost/lib/kmod/pan_kmod.h            |  13 ++
+ src/panfrost/vulkan/panvk_physical_device.c |  46 ++++-
+ 3 files changed, 268 insertions(+), 7 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/pan_kmod.c b/src/panfrost/lib/kmod/pan_kmod.c
+index 277df8c..6d9cb65 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -4,10 +4,18 @@
+  */
+ 
+ #include <errno.h>
++#include <inttypes.h>
++#include <signal.h>
+ #include <string.h>
++#include <unistd.h>
+ #include <xf86drm.h>
+ 
++#include "c11/threads.h"
+ #include "util/cache_ops.h"
++#include "util/os_file.h"
++#include "util/os_misc.h"
++#include "util/u_debug.h"
++#include "util/u_math.h"
+ #include "util/u_memory.h"
+ #include "util/macros.h"
+ #include "pan_kmod.h"
+@@ -130,12 +138,217 @@ pan_kmod_dev_destroy(struct pan_kmod_dev *dev)
+    dev->ops->dev_destroy(dev);
+ }
+ 
++/* GPU memory guard.
++ *
++ * The kernel's OOM handling can't get GPU memory back in time: GPU pages can't
++ * be swapped, and kbase only returns a process's GPU pages when its GPU
++ * context is torn down at exit, so when a process allocates GPU memory until
++ * the system runs out, killing it frees nothing quickly and the OOM killer
++ * works its way through the rest of the system until the kernel panics (a
++ * game took ~9 GB of GPU memory on an 8 GB device this way). So that an
++ * out-of-memory situation ends in this process rather than in the system:
++ *
++ *  - this process's GPU buffers are capped at what a game can actually get:
++ *    RAM minus what the rest of the system needs (RAM / 8 clamped to
++ *    [768 MiB, 2 GiB] plus 2.5 GiB for the OS and the game's CPU side), at
++ *    least 4 GiB or half the RAM if less, at most 75% of the RAM (4.2 GiB on
++ *    8 GB, ~7.5 GiB on 12 GB, ~11 GiB on 16 GB). PanVK reports the same
++ *    figure as its heap size. PAN_MEM_LIMIT_MB overrides it, 0 disables the
++ *    guard;
++ *  - an allocation also fails while MemAvailable is below twice the critical
++ *    level and swap can't make room any more (less than 1/8 of it free, or
++ *    none): a game's CPU side normally gets swapped out when memory is low,
++ *    so low MemAvailable alone is no reason to refuse;
++ *  - if MemAvailable drops below the critical level (RAM / 24 clamped to
++ *    [256 MiB, 768 MiB]) while this process holds more than that in GPU
++ *    buffers, the process kills itself: its GPU memory is freed on exit and
++ *    nothing else is touched.
++ *
++ * Failed allocations return NULL (VK_ERROR_OUT_OF_DEVICE_MEMORY for the app).
++ * /proc/meminfo is read once per 64 MiB of new allocations, and on every
++ * allocation while memory is low.
++ */
++#define PAN_MEM_CHECK_STEP (64ull << 20)
++
++static struct {
++   once_flag once;
++   uint64_t limit;
++   uint64_t critical;
++   uint64_t held;
++   uint64_t unchecked;
++   uint32_t low;
++   uint32_t refusals;
++   /* Live accounted BOs by log2(size), for the diagnostic. */
++   uint32_t live[64];
++} pan_mem = { .once = ONCE_FLAG_INIT };
++
++uint64_t
++pan_kmod_mem_limit_for(uint64_t total)
++{
++   uint64_t other = CLAMP(total / 8, 768ull << 20, 2048ull << 20) +
++                    (2560ull << 20);
++   uint64_t size = total > other ? total - other : 0;
++
++   size = CLAMP(size, MIN2(4ull << 30, total / 2), total / 4 * 3);
++   return ROUND_DOWN_TO(size, 1 << 20);
++}
++
++static void
++pan_mem_init(void)
++{
++   int64_t mb = debug_get_num_option("PAN_MEM_LIMIT_MB", -1);
++   uint64_t total;
++
++   if (!os_get_total_physical_memory(&total))
++      return;
++
++   pan_mem.limit = mb >= 0 ? (uint64_t)mb << 20 : pan_kmod_mem_limit_for(total);
++   pan_mem.critical = CLAMP(total / 24, 256ull << 20, 768ull << 20);
++
++   mesa_logi("pan_kmod: GPU memory guard: limit %" PRIu64 " MiB, critical "
++             "level %" PRIu64 " MiB%s", pan_mem.limit >> 20,
++             pan_mem.critical >> 20, pan_mem.limit ? "" : " (disabled)");
++}
++
++uint64_t
++pan_kmod_mem_limit(void)
++{
++   call_once(&pan_mem.once, pan_mem_init);
++   return pan_mem.limit;
++}
++
++uint64_t
++pan_kmod_mem_held(void)
++{
++   return p_atomic_read(&pan_mem.held);
++}
++
++/* MemAvailable, SwapTotal and SwapFree in bytes. */
++static bool
++pan_mem_read_meminfo(uint64_t *avail, uint64_t *swap_total,
++                     uint64_t *swap_free)
++{
++   char *meminfo = os_read_file("/proc/meminfo", NULL);
++   if (!meminfo)
++      return false;
++
++   const char *keys[] = { "MemAvailable:", "SwapTotal:", "SwapFree:" };
++   uint64_t *vals[] = { avail, swap_total, swap_free };
++   bool ok = true;
++
++   for (unsigned i = 0; i < ARRAY_SIZE(keys); i++) {
++      const char *str = strstr(meminfo, keys[i]);
++      unsigned long long kb;
++
++      if (str && sscanf(str + strlen(keys[i]), "%llu", &kb) == 1)
++         *vals[i] = (uint64_t)kb << 10;
++      else
++         ok = false;
++   }
++
++   free(meminfo);
++   return ok;
++}
++
++static void
++pan_mem_log(const char *what, uint64_t size, uint32_t flags, uint64_t avail,
++            uint64_t swap_free)
++{
++   char sizes[512];
++   int n = 0;
++
++   sizes[0] = '\0';
++   for (unsigned i = 0; i < ARRAY_SIZE(pan_mem.live); i++) {
++      uint32_t count = p_atomic_read(&pan_mem.live[i]);
++      if (count && n < (int)sizeof(sizes))
++         n += snprintf(sizes + n, sizeof(sizes) - n, " %" PRIu64 "K:%u",
++                       (uint64_t)1 << i >> 10, count);
++   }
++
++   mesa_loge("pan_kmod: %s: request %" PRIu64 " KiB (flags 0x%x), "
++             "this process holds %" PRIu64 " MiB of GPU buffers (limit %"
++             PRIu64 " MiB), MemAvailable %" PRIu64 " MiB, SwapFree %" PRIu64
++             " MiB; live buffers by size class:%s",
++             what, size >> 10, flags, p_atomic_read(&pan_mem.held) >> 20,
++             pan_mem.limit >> 20, avail >> 20, swap_free >> 20, sizes);
++}
++
++static bool
++pan_mem_refuse(const char *what, uint64_t size, uint32_t flags)
++{
++   uint32_t refusals = p_atomic_inc_return(&pan_mem.refusals);
++   uint64_t avail = 0, swap_total = 0, swap_free = 0;
++
++   if (refusals == 1 || !(refusals & 255)) {
++      pan_mem_read_meminfo(&avail, &swap_total, &swap_free);
++      pan_mem_log(what, size, flags, avail, swap_free);
++   }
++   return false;
++}
++
++/* Returns false if the allocation must fail. */
++static bool
++pan_mem_admit(uint64_t size, uint32_t flags)
++{
++   if (!pan_kmod_mem_limit())
++      return true;
++
++   if (p_atomic_read(&pan_mem.held) + size > pan_mem.limit)
++      return pan_mem_refuse("GPU allocation refused: over this process's GPU "
++                            "memory limit", size, flags);
++
++   uint64_t pending = p_atomic_add_return(&pan_mem.unchecked, size);
++   if (!p_atomic_read(&pan_mem.low) && pending < PAN_MEM_CHECK_STEP)
++      return true;
++
++   p_atomic_set(&pan_mem.unchecked, 0);
++
++   uint64_t avail, swap_total, swap_free;
++   if (!pan_mem_read_meminfo(&avail, &swap_total, &swap_free))
++      return true;
++
++   if (avail < pan_mem.critical &&
++       p_atomic_read(&pan_mem.held) > pan_mem.critical) {
++      pan_mem_log("system memory critically low, killing this process to "
++                  "release its GPU memory", size, flags, avail, swap_free);
++      kill(getpid(), SIGKILL);
++   }
++
++   bool low = avail < 2 * pan_mem.critical + size;
++   p_atomic_set(&pan_mem.low, low);
++
++   if (low && swap_free <= swap_total / 8)
++      return pan_mem_refuse("GPU allocation refused: system memory low and "
++                            "swap full", size, flags);
++
++   return true;
++}
++
++static void
++pan_mem_account(struct pan_kmod_bo *bo, bool add)
++{
++   unsigned class = MIN2(util_logbase2_64(MAX2(bo->size, 1)),
++                         ARRAY_SIZE(pan_mem.live) - 1);
++
++   if (add) {
++      bo->mem_accounted = true;
++      p_atomic_add(&pan_mem.held, bo->size);
++      p_atomic_inc(&pan_mem.live[class]);
++   } else {
++      p_atomic_add(&pan_mem.held, -bo->size);
++      p_atomic_dec(&pan_mem.live[class]);
++   }
++}
++
+ struct pan_kmod_bo *
+ pan_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm,
+                   uint64_t size, uint32_t flags)
+ {
+    struct pan_kmod_bo *bo;
+ 
++   if (!pan_mem_admit(size, flags))
++      return NULL;
++
+    bo = dev->ops->bo_alloc(dev, exclusive_vm, size, flags);
+    if (!bo)
+       return NULL;
+@@ -155,6 +368,7 @@ pan_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm,
+ 
+    assert(*slot == NULL);
+    *slot = bo;
++   pan_mem_account(bo, true);
+    return bo;
+ }
+ 
+@@ -184,6 +398,8 @@ pan_kmod_bo_put(struct pan_kmod_bo *bo)
+ 
+       assert(slot);
+       *slot = NULL;
++      if (bo->mem_accounted)
++         pan_mem_account(bo, false);
+       bo->dev->ops->bo_free(bo);
+    }
+ 
+diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index 250750f..410c410 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -183,6 +183,11 @@ struct pan_kmod_bo {
+    /* True if some deferred syncs targetting this BO are pending. */
+    bool has_pending_deferred_syncs;
+ 
++   /* True if the BO was allocated by this process and is counted by the GPU
++    * memory guard (see pan_kmod_mem_limit()).
++    */
++   bool mem_accounted;
++
+    /* If non-NULL, the buffer object can only by mapped on this VM. Typical
+     * the case for all internal/non-shareable buffers. The backend can
+     * optimize things based on this information. Calling pan_kmod_bo_export()
+@@ -713,6 +718,14 @@ struct pan_kmod_bo *pan_kmod_bo_alloc(struct pan_kmod_dev *dev,
+                                       struct pan_kmod_vm *exclusive_vm,
+                                       uint64_t size, uint32_t flags);
+ 
++/* GPU memory guard (see pan_kmod.c): the GPU memory (bytes) this process may
++ * hold, 0 if the guard is disabled; the limit for a given amount of RAM; and
++ * what the process holds now.
++ */
++uint64_t pan_kmod_mem_limit(void);
++uint64_t pan_kmod_mem_limit_for(uint64_t total_ram);
++uint64_t pan_kmod_mem_held(void);
++
+ static inline struct pan_kmod_bo *
+ pan_kmod_bo_get(struct pan_kmod_bo *bo)
+ {
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 6369027..6f32f77 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -505,6 +505,28 @@ get_core_masks(struct panvk_physical_device *device,
+    return result;
+ }
+ 
++static uint64_t
++panvk_heap_size(struct panvk_instance *instance)
++{
++   float *percent = &instance->drirc.misc.heap_memory_percent;
++   uint64_t total;
++
++   if (*percent != OS_GPU_HEAP_SIZE_HEURISTIC ||
++       !os_get_total_physical_memory(&total))
++      return os_get_gpu_heap_size(*percent, percent);
++
++   /* The GPU shares RAM with everything else, and engines size their pools
++    * from the heap size as if it were dedicated VRAM: report what a game can
++    * actually get, the GPU memory guard's limit (see pan_kmod.c).
++    */
++   uint64_t size = pan_kmod_mem_limit();
++   if (!size)
++      size = pan_kmod_mem_limit_for(total);
++
++   *percent = (float)size / total;
++   return size;
++}
++
+ static VkResult
+ get_device_heaps(struct panvk_physical_device *device,
+                  struct panvk_instance *instance)
+@@ -512,9 +534,7 @@ get_device_heaps(struct panvk_physical_device *device,
+    int host_coherent_not_cached_idx = -1;
+    int host_cached_not_coherent_idx = -1;
+ 
+-   const uint64_t heap_size =
+-      os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent,
+-                           &instance->drirc.misc.heap_memory_percent);
++   const uint64_t heap_size = panvk_heap_size(instance);
+ 
+    device->memory.heap_count = 1;
+    device->memory.heaps[0] = (VkMemoryHeap){
+@@ -1758,10 +1778,22 @@ panvk_GetPhysicalDeviceMemoryProperties2(
+           */
+          p->heapUsage[0] = used;
+ 
+-         /* Set the budget at 90% of available to avoid thrashing */
+-         p->heapBudget[0] = vk_physical_device_heap_budget(
+-            panvk_available_system_memory(physical_device), 0.9f, heap_size,
+-            used);
++         /* With the GPU memory guard, budget what this process may still
++          * allocate under its limit (allocations past it fail); otherwise 90%
++          * of what is available. Never 0, as the spec requires.
++          */
++         uint64_t limit = pan_kmod_mem_limit();
++         if (limit) {
++            uint64_t held = pan_kmod_mem_held();
++            uint64_t room = limit > held ? limit - held : 0;
++            p->heapBudget[0] =
++               MAX2(ROUND_DOWN_TO(MIN2(heap_size, used + room), 1 << 20),
++                    1ull << 20);
++         } else {
++            p->heapBudget[0] = vk_physical_device_heap_budget(
++               panvk_available_system_memory(physical_device), 0.9f,
++               heap_size, used);
++         }
+ 
+          /* From the Vulkan 1.3.278 spec:
+           *
+-- 
+2.55.0
+
