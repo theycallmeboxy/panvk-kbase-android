@@ -27,7 +27,7 @@ Purpose: drop the deferred sync object signal after each fragment job in primary
 Upstream-commit: none (generic PanVK CSF; upstream candidate)
 Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
-Dependencies: csf-v11/192
+Dependencies: rg477m/010
 Validation test: drawbench pass tests 7-15% faster (loadpasses, indep, passes, mixclear), draws unchanged, image checksums unchanged; Hades Vulkan renderer 1255 MHz 173.1 -> 177.9 fps (A-B-B-A); Hades DXVK 103.3 -> 104.2 fps at 502 MHz; Serious Sam D3D11 46.8 -> 48.2, Vulkan 53.2 -> 52.9 fps; racetest all cases 0/100 stale, controls 100/100; PanProbe 38/38; no GPU faults
 Generated-by: LLM
 ---

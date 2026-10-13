@@ -16,6 +16,8 @@ SERIES="common android kbase-common app-loader wsi"
 if [ "$FRONTEND" = "CSF" ]; then SERIES="$SERIES csf csf-v$ARCH"; else SERIES="$SERIES jm-v$ARCH"; fi
 # Universal ICD: jm-v9 sits on top of the csf-v11 series (v9 JM + v10-v14 CSF).
 if [ "$PROFILE" = "g615-v11-csf" ]; then SERIES="$SERIES jm-v9"; fi
+# rg477m fork: our fixes, applied last, numbered in our own namespace so upstream numbering never collides.
+[ -d "$ROOT/patches/rg477m" ] && SERIES="$SERIES rg477m"
 echo "profile=$PROFILE arch=$ARCH frontend=$FRONTEND series: $SERIES"
 git -C "$MESA" status --porcelain | head -n 5
 APPLIED=0
