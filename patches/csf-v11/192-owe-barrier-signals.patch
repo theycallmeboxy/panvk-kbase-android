@@ -26,7 +26,7 @@ Purpose: record barrier signals that only deferred waits target as owed sync poi
 Upstream-commit: none (generic PanVK CSF; upstream candidate)
 Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
-Dependencies: csf-v11/190
+Dependencies: csf-v11/191
 Validation test: drawbench loadpasses 64 at 1255 MHz 1.22 -> 1.04 ms; Hades Vulkan renderer 1255 MHz 160.0 -> 170.3 fps, normal clocks 51.5 -> 59.6 fps; Hades DXVK 103.2 -> 103.3 fps at 502 MHz; Serious Sam (189-191 together) Vulkan 51.9 -> 52.9, D3D11 46.5 -> 47.0 fps; racetest incl. direct render pass -> vertex shader 0/100 stale, controls 100/100; drawbench image checksums unchanged; PanProbe 38/38
 Generated-by: LLM
 ---

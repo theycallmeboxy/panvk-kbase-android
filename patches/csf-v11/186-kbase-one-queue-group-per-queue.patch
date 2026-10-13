@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 21:01:19 -0400
-Subject: [PATCH] panvk/kbase: use one queue group with a stream per
- subqueue
+Subject: [PATCH] panvk/kbase: use one queue group with a stream per subqueue
 
 The kbase backend created a CSF queue group per subqueue. Every
 cross-subqueue wait (each render pass, each submit) can then leave a

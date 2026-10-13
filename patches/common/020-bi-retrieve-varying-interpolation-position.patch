@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 21:01:19 -0400
-Subject: [PATCH] pan/bi: retrieve the interpolation position for later
- varying loads
+Subject: [PATCH] pan/bi: retrieve the interpolation position for later varying
+ loads
 
 Every interpolated varying load is emitted with .store, which recomputes
 the interpolation position and writes the hidden varying state, so

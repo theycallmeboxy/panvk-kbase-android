@@ -35,8 +35,8 @@ Purpose: skip redundant barrier waits and flushes, and keep the idle compute sub
 Upstream-commit: none (generic PanVK CSF; upstream candidate)
 Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
-Dependencies: csf-v11/187, csf-v11/189
-Validation test: with csf-v11/189: drawbench loadpasses 64 at 1255 MHz 2.66 -> 1.22 ms (DDK 0.64); Hades Vulkan renderer 1255 MHz 123.4 -> 160.0 fps, normal clocks 31.4 -> 51.5 fps (DDK 132.2 / 37.2); Hades DXVK and Serious Sam unchanged; racetest (render pass -> compute/vertex shader, same/cross command buffer/submit, chains) 0/100 stale, no-barrier controls 100/100; drawbench image checksums unchanged; PanProbe 38/38; no GPU faults
+Dependencies: csf-v11/188, csf-v11/190
+Validation test: with csf-v11/190: drawbench loadpasses 64 at 1255 MHz 2.66 -> 1.22 ms (DDK 0.64); Hades Vulkan renderer 1255 MHz 123.4 -> 160.0 fps, normal clocks 31.4 -> 51.5 fps (DDK 132.2 / 37.2); Hades DXVK and Serious Sam unchanged; racetest (render pass -> compute/vertex shader, same/cross command buffer/submit, chains) 0/100 stale, no-barrier controls 100/100; drawbench image checksums unchanged; PanProbe 38/38; no GPU faults
 Generated-by: LLM
 ---
  src/panfrost/genxml/cs_builder.h              |   6 +
