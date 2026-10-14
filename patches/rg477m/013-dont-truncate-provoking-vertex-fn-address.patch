@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
 
 Purpose: keep the GPU address of fn_set_fbds_provoking_vertex 64-bit; truncated to 32 bits, render passes that start before the provoking vertex mode is known called an unmapped address on kbase (CS_BUS_FAULT), e.g. every DOOM 3 BFG launch through Zink
-Upstream-commit: Mesa main already declares fn_addr as uint64_t (backport)
+Upstream-commit: 4ecc4966 ("panvk: Don't downcast CS func address to a 32-bit VA", Mesa main 2026-09-24; not in the pinned base 5a07217)
 Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none
