@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 08:07:55 -0400
+Subject: [PATCH] panvk: allocate the gpu_prerast arenas on first use
+
+The gpu_prerast arenas (64 MiB, plus 96 MiB for tessellation) were
+allocated and fully committed when a device enabled geometry shaders,
+tessellation, transform feedback, non-solid fill, viewport index output or
+vertex-stage stores. DXVK enables those on every device, as D3D11 requires
+them, so every DXVK game paid 160 MiB of GPU memory per VkDevice whether or
+not it ever drew through gpu_prerast (most never do). The arenas are still
+fully committed (growing them on GPU faults loses the first gpu_prerast
+draw's output on MediaTek kbase), but now on the first draw that needs one,
+under a device lock; if that allocation fails the command buffer fails with
+VK_ERROR_OUT_OF_DEVICE_MEMORY.
+
+Whether a device may use gpu_prerast is now kept in gpu_prerast_enabled /
+gpu_prerast_tess_enabled, set from the features at creation as before, and
+that, not whether the memory exists yet, decides the extra barrier
+dependency on the compute subqueue, so barriers behave as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: stop committing the gpu_prerast arenas (64 MiB + 96 MiB for tessellation) at device creation; DXVK enables the features that trigger them on every device, so every DXVK game paid up to 160 MiB per VkDevice; they are now allocated (still fully committed) on the first draw that needs them, and barrier behaviour keys on the enabled features as before
+Upstream-commit: none (zenithblue fork code; the fork's own comment names lazy commit as the upgrade path)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none of ours; applies on the full g615-v11-csf series
+Validation test: PanProbe 38/38 (geometry, tessellation, xfb, gs_viewport_depth, gs_tess_primitive_id pass); drawbench 8/8, racetest and msrtss identical; peak GPU memory Megabonk 1258 -> 1180 MB, Moonlighter 793 -> 637 MB, Valheim 2054 -> 1990 MB, same fps
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c |  3 +-
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   | 20 +++--
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c    |  4 +-
+ src/panfrost/vulkan/panvk_device.h            | 16 ++++
+ src/panfrost/vulkan/panvk_vX_device.c         | 84 +++++++++++--------
+ 5 files changed, 81 insertions(+), 46 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index 4c158c7..4a23686 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -627,8 +627,7 @@ collect_cs_deps(struct panvk_cmd_buffer *cmdbuf, const VkDependencyInfo *info,
+    uint32_t wait_masks[PANVK_SUBQUEUE_COUNT] = {0};
+    add_execution_dependency(
+       wait_masks, src.stages, dst.stages,
+-      panvk_priv_mem_check_alloc(dev->gpu_prerast_arena) ||
+-         panvk_priv_mem_check_alloc(dev->gpu_prerast_tess_arena));
++      dev->gpu_prerast_enabled || dev->gpu_prerast_tess_enabled);
+ 
+    if (cmdbuf->state.gfx.render.tiler || inherits_render_ctx(cmdbuf)) {
+       if (info->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT) {
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 808aad6..bf91fcb 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -4353,7 +4353,11 @@ gpu_prerast_draw(struct panvk_cmd_buffer *cmdbuf,
+       return true;
+    }
+ 
+-   uint64_t arena = panvk_priv_mem_dev_addr(dev->gpu_prerast_arena);
++   uint64_t arena = panvk_per_arch(gpu_prerast_get_arena)(dev, false);
++   if (!arena) {
++      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return true;
++   }
+    uint64_t records = arena + PANVK_GPU_PRERAST_RECORD_OFFSET;
+    uint64_t indices = arena + PANVK_GPU_PRERAST_INDEX_OFFSET;
+    const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
+@@ -4888,7 +4892,7 @@ gpu_prerast_tess(struct panvk_cmd_buffer *cmdbuf,
+ 
+    if (!tcs || !tes || !tcs->gpu_prerast.tess.compiled ||
+        !vs->gpu_prerast.lowered_vs_compiled ||
+-       !panvk_priv_mem_check_alloc(dev->gpu_prerast_tess_arena)) {
++       !panvk_per_arch(gpu_prerast_get_arena)(dev, true)) {
+       gpu_prerast_unhandled("tessellation shaders missing");
+       return;
+    }
+@@ -4961,15 +4965,15 @@ gpu_prerast_tess(struct panvk_cmd_buffer *cmdbuf,
+                       panvk_gpu_prerast_gs_cap_slots(&gs->gpu_prerast.gs) /
+                          MAX2(gs->gpu_prerast.gs.invocations, 1));
+       range = verts / vpp * vpp;
+-      if (!range || !panvk_priv_mem_check_alloc(dev->gpu_prerast_arena)) {
++      if (!range || !panvk_per_arch(gpu_prerast_get_arena)(dev, false)) {
+          gpu_prerast_unhandled("tessellation output range");
+          return;
+       }
+    }
+ 
+-   const uint64_t arena = panvk_priv_mem_dev_addr(dev->gpu_prerast_tess_arena);
++   const uint64_t arena = panvk_per_arch(gpu_prerast_get_arena)(dev, true);
+    const uint64_t prerast_arena =
+-      nested ? panvk_priv_mem_dev_addr(dev->gpu_prerast_arena) : 0;
++      nested ? panvk_per_arch(gpu_prerast_get_arena)(dev, false) : 0;
+    struct panvk_gpu_prerast_tess_layout l;
+    panvk_gpu_prerast_tess_layout(arena, max_patches, tc->stride_el * 4, &l);
+ 
+@@ -5464,7 +5468,11 @@ gpu_prerast_chunk_loop(struct panvk_cmd_buffer *cmdbuf,
+    const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
+    const bool indirect = draw->indirect.buffer_dev_addr != 0;
+    const bool indexed = draw->index.index_size != 0;
+-   const uint64_t arena = panvk_priv_mem_dev_addr(dev->gpu_prerast_arena);
++   const uint64_t arena = panvk_per_arch(gpu_prerast_get_arena)(dev, false);
++   if (!arena) {
++      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return;
++   }
+ 
+    struct pan_ptr cd =
+       panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(struct panlib_chunk_draw), 16);
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index e2d92e6..7b097ca 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -3396,7 +3396,7 @@ v9_prerast_draw_one(struct panvk_cmd_buffer *cmdbuf,
+ {
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    const struct panvk_shader *shader = cmdbuf->state.gfx.vs.shader;
+-   const uint64_t arena = panvk_priv_mem_dev_addr(dev->gpu_prerast_arena);
++   const uint64_t arena = panvk_per_arch(gpu_prerast_get_arena)(dev, false);
+ 
+    if (!arena ||
+        !panvk_per_arch(gpu_prerast_can_lower)(cmdbuf, src,
+@@ -3861,7 +3861,7 @@ v9_tess_draw(struct panvk_cmd_buffer *cmdbuf,
+    const struct panvk_shader *tcs = cmdbuf->state.gfx.tcs.shader;
+    const struct panvk_shader *tes = cmdbuf->state.gfx.tes.shader;
+    const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
+-   const uint64_t arena = panvk_priv_mem_dev_addr(dev->gpu_prerast_tess_arena);
++   const uint64_t arena = panvk_per_arch(gpu_prerast_get_arena)(dev, true);
+ 
+    if (!vs || !tcs || !tes || !tcs->gpu_prerast.tess.compiled ||
+        !vs->gpu_prerast.lowered_vs_compiled || !arena) {
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 398b8e8..a75000c 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -126,8 +126,16 @@ struct panvk_device {
+    } utrace;
+ 
+    struct panvk_device_draw_context* draw_ctx;
++   /* Allocated on first use by panvk_per_arch(gpu_prerast_get_arena)():
++    * DXVK enables the features that need them on every device, and most
++    * games never draw through gpu_prerast. The *_enabled flags say whether
++    * the device may use them (they decide barrier behaviour, so they don't
++    * change when the memory is allocated). */
+    struct panvk_priv_mem gpu_prerast_arena;
+    struct panvk_priv_mem gpu_prerast_tess_arena;
++   bool gpu_prerast_enabled;
++   bool gpu_prerast_tess_enabled;
++   simple_mtx_t gpu_prerast_lock;
+    /* struct panvk_gpu_prerast_syncs */
+    struct panvk_priv_bo *gpu_prerast_syncs;
+ 
+@@ -324,6 +332,14 @@ VkResult panvk_per_arch(device_check_status)(struct vk_device *vk_dev);
+ #if PAN_ARCH >= 10
+ VkResult panvk_per_arch(init_tiler_oom)(struct panvk_device *device);
+ #endif
++
++#if PAN_ARCH >= 9
++/* GPU address of the gpu_prerast (tess = false) or tessellation arena,
++ * allocating it on first use; 0 if the device doesn't use it or the
++ * allocation failed. */
++uint64_t panvk_per_arch(gpu_prerast_get_arena)(struct panvk_device *dev,
++                                               bool tess);
++#endif
+ #endif
+ 
+ #endif
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 99c3435..0e54e62 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -131,12 +131,13 @@ panvk_device_cleanup_tls(struct panvk_device *dev)
+ }
+ 
+ #if PAN_ARCH >= 9
+-/* Commit the gpu_prerast arenas at creation.  On MediaTek kbase (CSF 1.21),
+- * GPU-fault growth loses the first gpu_prerast draw's output: PanProbe
+- * gs_viewport_depth case A drew nothing on every run; without alloc-on-fault,
+- * 6/6 runs pass.
+- * ponytail: commits 160 MiB per VkDevice enabling GS/tess/XFB features;
+- * upgrade path = KBASE_IOCTL_MEM_COMMIT on first gpu_prerast use. */
++/* The gpu_prerast arenas are fully committed when allocated: on MediaTek
++ * kbase (CSF 1.21), GPU-fault growth loses the first gpu_prerast draw's
++ * output (PanProbe gs_viewport_depth case A drew nothing on every run;
++ * without alloc-on-fault, 6/6 runs pass). They are allocated on the first
++ * draw that needs them (panvk_per_arch(gpu_prerast_get_arena)), not at
++ * device creation: 160 MiB per VkDevice otherwise, and DXVK enables the
++ * features on every device. */
+ static struct panvk_priv_mem
+ alloc_gpu_prerast_arena(struct panvk_device *dev, uint64_t size)
+ {
+@@ -150,6 +151,35 @@ alloc_gpu_prerast_arena(struct panvk_device *dev, uint64_t size)
+ 
+    return (struct panvk_priv_mem){.bo = (uintptr_t)bo};
+ }
++
++uint64_t
++panvk_per_arch(gpu_prerast_get_arena)(struct panvk_device *dev, bool tess)
++{
++   struct panvk_priv_mem *mem =
++      tess ? &dev->gpu_prerast_tess_arena : &dev->gpu_prerast_arena;
++   const bool enabled =
++      tess ? dev->gpu_prerast_tess_enabled : dev->gpu_prerast_enabled;
++
++   if (!enabled)
++      return 0;
++
++   simple_mtx_lock(&dev->gpu_prerast_lock);
++   if (!panvk_priv_mem_check_alloc(*mem)) {
++      struct panvk_priv_mem arena_mem = alloc_gpu_prerast_arena(
++         dev, tess ? PANVK_GPU_PRERAST_TESS_ARENA_SIZE
++                   : PANVK_GPU_PRERAST_ARENA_SIZE);
++      if (panvk_priv_mem_check_alloc(arena_mem)) {
++         panvk_priv_mem_write(arena_mem, 0, struct panvk_gpu_prerast_arena,
++                              arena) {
++            memset(arena, 0, sizeof(*arena));
++         }
++         *mem = arena_mem;
++      }
++   }
++   simple_mtx_unlock(&dev->gpu_prerast_lock);
++
++   return panvk_priv_mem_check_alloc(*mem) ? panvk_priv_mem_dev_addr(*mem) : 0;
++}
+ #endif
+ 
+ static VkResult
+@@ -620,36 +650,16 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+    util_dynarray_init(&device->tls.bos, NULL);
+ 
+ #if PAN_ARCH >= 9
+-   if (PANVK_DEBUG(GPU_PRERAST) || device->vk.enabled_features.fillModeNonSolid ||
+-       device->vk.enabled_features.geometryShader ||
+-       device->vk.enabled_features.transformFeedback ||
+-       device->vk.enabled_features.shaderOutputViewportIndex ||
+-       device->vk.enabled_features.vertexPipelineStoresAndAtomics) {
+-      device->gpu_prerast_arena =
+-         alloc_gpu_prerast_arena(device, PANVK_GPU_PRERAST_ARENA_SIZE);
+-      if (!panvk_priv_mem_check_alloc(device->gpu_prerast_arena)) {
+-         result = panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+-         goto err_free_priv_bos;
+-      }
+-      panvk_priv_mem_write(device->gpu_prerast_arena, 0,
+-                           struct panvk_gpu_prerast_arena, arena) {
+-         memset(arena, 0, sizeof(*arena));
+-      }
+-   }
+-   if (device->vk.enabled_features.tessellationShader) {
+-      device->gpu_prerast_tess_arena =
+-         alloc_gpu_prerast_arena(device, PANVK_GPU_PRERAST_TESS_ARENA_SIZE);
+-      if (!panvk_priv_mem_check_alloc(device->gpu_prerast_tess_arena)) {
+-         result = panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+-         goto err_free_priv_bos;
+-      }
+-      panvk_priv_mem_write(device->gpu_prerast_tess_arena, 0,
+-                           struct panvk_gpu_prerast_arena, arena) {
+-         memset(arena, 0, sizeof(*arena));
+-      }
+-   }
+-   if (panvk_priv_mem_check_alloc(device->gpu_prerast_arena) ||
+-       panvk_priv_mem_check_alloc(device->gpu_prerast_tess_arena)) {
++   simple_mtx_init(&device->gpu_prerast_lock, mtx_plain);
++   device->gpu_prerast_enabled =
++      PANVK_DEBUG(GPU_PRERAST) || device->vk.enabled_features.fillModeNonSolid ||
++      device->vk.enabled_features.geometryShader ||
++      device->vk.enabled_features.transformFeedback ||
++      device->vk.enabled_features.shaderOutputViewportIndex ||
++      device->vk.enabled_features.vertexPipelineStoresAndAtomics;
++   device->gpu_prerast_tess_enabled =
++      device->vk.enabled_features.tessellationShader;
++   if (device->gpu_prerast_enabled || device->gpu_prerast_tess_enabled) {
+       result = panvk_priv_bo_create(
+          device, sizeof(struct panvk_gpu_prerast_syncs),
+          device->kmod.dev->props.supported_bo_flags &
+@@ -812,6 +822,7 @@ err_free_priv_bos:
+    panvk_priv_bo_unref(device->gpu_prerast_syncs);
+    panvk_pool_free_mem(&device->gpu_prerast_tess_arena);
+    panvk_pool_free_mem(&device->gpu_prerast_arena);
++   simple_mtx_destroy(&device->gpu_prerast_lock);
+    if (device->printf.bo)
+       u_printf_destroy(&device->printf.ctx);
+    panvk_priv_bo_unref(device->printf.bo);
+@@ -881,6 +892,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
+     panvk_priv_bo_unref(device->gpu_prerast_syncs);
+     panvk_pool_free_mem(&device->gpu_prerast_tess_arena);
+     panvk_pool_free_mem(&device->gpu_prerast_arena);
++    simple_mtx_destroy(&device->gpu_prerast_lock);
+     panvk_device_cleanup_mempools(device);
+    vk_free(&device->vk.alloc, device->dump_region_size);
+    pan_kmod_vm_destroy(device->kmod.vm);
+-- 
+2.55.0
+
