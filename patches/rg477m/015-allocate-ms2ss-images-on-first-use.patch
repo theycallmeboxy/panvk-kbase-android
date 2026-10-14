@@ -1,0 +1,543 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:29:48 -0400
+Subject: [PATCH] panvk: allocate ms2ss images' memory on first use
+
+An image created with VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT
+gets a hidden multisampled image for every supported sample count (4x, 8x and
+16x on Mali-G615), and their sizes were added to the image's memory
+requirements and bound into the application's memory. Such an image cost
+1 + 4 + 8 + 16 = 29 times its single-sampled size, whether or not it was
+ever rendered to with multisampling.
+
+Zink sets the flag on every colour-renderable image when the extension is
+available, so OpenGL games through Zink paid it on most of their textures:
+DOOM 3 BFG grew to 4 GB of GPU memory (1.2 GB with the extension hidden; the
+stock Mali driver, which also exposes the extension, uses 0.8 GB).
+
+Report and bind only the single-sampled image. A multisampled image gets its
+own driver-owned memory the first time a render pass uses that sample count
+with ms2ss, and its view is created then too (views bake image addresses into
+their descriptors). Both are serialized by a lock. If the allocation fails,
+the command buffer fails with VK_ERROR_OUT_OF_DEVICE_MEMORY. The memory is
+freed with the image.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: stop VK_EXT_multisampled_render_to_single_sampled images from reserving 2x/4x/8x/16x multisampled copies up front (29x the image's size on Mali-G615); Zink sets the flag on every colour-renderable image, so OpenGL games through Zink ran out of GPU memory (DOOM 3 BFG 4 GB, Jupiter Hell 4.2 GB while loading)
+Upstream-commit: none (Mesa main has the same eager allocation; upstream candidate)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none of ours; applies on the full g615-v11-csf series
+Validation test: msrtss (64x64 RGBA8 ms2ss image; clear+draw at 4x, load+draw at 8x, load+blend at 16x, average resolve): identical pixels to the unpatched driver, edge pixels blended, 20 create/use/destroy loops stable; memory requirement 468 KiB -> 20 KiB. DOOM 3 BFG peak GPU memory 4073 -> 1237 MB, Jupiter Hell 4.2 GB (cap) -> 1022 MB; drawbench checksums 8/8 and racetest identical
+Generated-by: LLM
+---
+ src/panfrost/vulkan/panvk_image.c         | 206 +++++++---------------
+ src/panfrost/vulkan/panvk_image.h         |  19 +-
+ src/panfrost/vulkan/panvk_image_view.h    |  15 +-
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c   |  23 ++-
+ src/panfrost/vulkan/panvk_vX_image_view.c |  69 +++++---
+ 5 files changed, 160 insertions(+), 172 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index 275aae3..9b6e8e5 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -863,7 +863,10 @@ create_ms_images(struct panvk_device *dev, struct panvk_image *img,
+    assert(ms_img_info.flags &
+           VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT);
+    ms_img_info.flags &=
+-      ~VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
++      ~(VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT |
++        VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++        VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
++        VK_IMAGE_CREATE_SPARSE_ALIASED_BIT);
+ 
+    for (uint32_t msaa_idx = 0; msaa_idx < ARRAY_SIZE(img->ms_imgs);
+         ++msaa_idx) {
+@@ -1025,6 +1028,7 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
+        VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+       for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+          panvk_DestroyImage(_device, image->ms_imgs[i], pAllocator);
++         panvk_FreeMemory(_device, image->ms_mems[i], NULL);
+       }
+    }
+ 
+@@ -1162,24 +1166,6 @@ panvk_image_get_sparse_binding_granularity(struct panvk_image *image)
+    return panvk_get_gpu_page_size(dev);
+ }
+ 
+-static void
+-append_ms_to_ss_memory_reqs(VkMemoryRequirements2 *pMemoryRequirements,
+-                            const VkMemoryRequirements2 *append)
+-{
+-   pMemoryRequirements->memoryRequirements.alignment =
+-      MAX2(pMemoryRequirements->memoryRequirements.alignment,
+-           append->memoryRequirements.alignment);
+-   /* After the previous images, align this images start properly. */
+-   pMemoryRequirements->memoryRequirements.size =
+-      align(pMemoryRequirements->memoryRequirements.size,
+-            append->memoryRequirements.alignment);
+-   pMemoryRequirements->memoryRequirements.size +=
+-      append->memoryRequirements.size;
+-   pMemoryRequirements->memoryRequirements.memoryTypeBits &=
+-      append->memoryRequirements.memoryTypeBits;
+-   assert(pMemoryRequirements->memoryRequirements.memoryTypeBits != 0);
+-}
+-
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_GetImageMemoryRequirements2(VkDevice device,
+                                   const VkImageMemoryRequirementsInfo2 *pInfo,
+@@ -1231,23 +1217,8 @@ panvk_GetImageMemoryRequirements2(VkDevice device,
+       }
+    }
+ 
+-   if (image->vk.create_flags &
+-       VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+-      for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+-         if (image->ms_imgs[i] == VK_NULL_HANDLE)
+-            continue;
+-
+-         VkImageMemoryRequirementsInfo2 info = *pInfo;
+-         info.image = image->ms_imgs[i];
+-
+-         VkMemoryRequirements2 sub_reqs_2 = {
+-            .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+-            .memoryRequirements = {},
+-         };
+-         panvk_GetImageMemoryRequirements2(device, &info, &sub_reqs_2);
+-         append_ms_to_ss_memory_reqs(pMemoryRequirements, &sub_reqs_2);
+-      }
+-   }
++   /* ms2ss images get their own driver-owned memory on first use, so they
++    * don't add to the requirements here. */
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1274,24 +1245,6 @@ panvk_GetDeviceImageMemoryRequirements(VkDevice device,
+    };
+    panvk_GetImageMemoryRequirements2(device, &info2, pMemoryRequirements);
+    vk_image_finish(&image.vk);
+-
+-   if (pInfo->pCreateInfo->flags &
+-       VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+-      for (uint32_t msaa_idx = 0; msaa_idx < ARRAY_SIZE(image.ms_imgs);
+-           ++msaa_idx) {
+-         /* idx 0 has sample count 2, 1 has sample count 4, ... */
+-         create_info.samples = 1 << (msaa_idx + 1);
+-         create_info.flags &=
+-            ~VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
+-
+-         VkMemoryRequirements2 msaa_reqs = {
+-            .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+-            .memoryRequirements = {},
+-         };
+-         panvk_GetDeviceImageMemoryRequirements(device, &info, &msaa_reqs);
+-         append_ms_to_ss_memory_reqs(pMemoryRequirements, &msaa_reqs);
+-      }
+-   }
+ }
+ 
+ /* Sparse block extents, in texel blocks, single sample.
+@@ -1427,90 +1380,6 @@ panvk_GetDeviceImageSparseMemoryRequirements(VkDevice device,
+ static VkResult panvk_image_bind(struct panvk_device *dev,
+                                  const VkBindImageMemoryInfo *bind_info);
+ 
+-static void
+-bind_ms_images(struct panvk_device *dev, const VkBindImageMemoryInfo *bind_info)
+-{
+-   VK_FROM_HANDLE(panvk_image, image, bind_info->image);
+-
+-   uint64_t total_size = 0;
+-   {
+-      VkImageMemoryRequirementsInfo2 reqs_info = {
+-         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+-         .image = bind_info->image,
+-      };
+-      VkMemoryRequirements2 reqs2 = {
+-         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+-         .memoryRequirements = {},
+-      };
+-      panvk_GetImageMemoryRequirements2(panvk_device_to_handle(dev), &reqs_info,
+-                                        &reqs2);
+-
+-      total_size = reqs2.memoryRequirements.size;
+-   }
+-
+-   uint64_t sub_sz[ARRAY_SIZE(image->ms_imgs)];
+-   uint64_t sub_al[ARRAY_SIZE(image->ms_imgs)];
+-
+-   for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+-      if (image->ms_imgs[i] == VK_NULL_HANDLE) {
+-         sub_sz[i] = 0;
+-         sub_al[i] = 1;
+-         continue;
+-      }
+-
+-      VkImageMemoryRequirementsInfo2 reqs_info = {
+-         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+-         .image = image->ms_imgs[i],
+-      };
+-      VkMemoryRequirements2 reqs2 = {
+-         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+-         .memoryRequirements = {},
+-      };
+-      panvk_GetImageMemoryRequirements2(panvk_device_to_handle(dev), &reqs_info,
+-                                        &reqs2);
+-
+-      sub_sz[i] = reqs2.memoryRequirements.size;
+-      sub_al[i] = reqs2.memoryRequirements.alignment;
+-   }
+-
+-   /*
+-    *           sub_imgs_aligned_size
+-    *        ----------------------------
+-    * [ base, sub_0, sub_1, sub_2, sub_3 ]
+-    *  -->-> -->->       ...      ------>
+-    *  sz a  sz a                size only
+-    */
+-   uint64_t sub_imgs_aligned_size = 0;
+-   for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+-      sub_imgs_aligned_size += sub_sz[i];
+-      if (i < ARRAY_SIZE(image->ms_imgs) - 1) {
+-         sub_imgs_aligned_size = align(sub_imgs_aligned_size, sub_al[i + 1]);
+-      }
+-   }
+-
+-   uint64_t sub_image_offset =
+-      bind_info->memoryOffset + total_size - sub_imgs_aligned_size;
+-
+-   for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+-      if (image->ms_imgs[i] == VK_NULL_HANDLE)
+-         continue;
+-
+-      sub_image_offset = align(sub_image_offset, sub_al[i]);
+-
+-      VkBindImageMemoryInfo sub_bind_info = {
+-         .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+-         .image = image->ms_imgs[i],
+-         .memory = bind_info->memory,
+-         .memoryOffset = sub_image_offset,
+-      };
+-
+-      ASSERTED const VkResult res = panvk_image_bind(dev, &sub_bind_info);
+-      assert(res == VK_SUCCESS);
+-
+-      sub_image_offset += sub_sz[i];
+-   }
+-}
+-
+ static VkResult
+ panvk_image_bind(struct panvk_device *dev,
+                  const VkBindImageMemoryInfo *bind_info)
+@@ -1571,13 +1440,66 @@ panvk_image_bind(struct panvk_device *dev,
+                                  VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+    }
+ 
+-   if (!!(image->vk.create_flags &
+-          VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT))
+-      bind_ms_images(dev, bind_info);
+-
+    return VK_SUCCESS;
+ }
+ 
++static simple_mtx_t ms_lock = SIMPLE_MTX_INITIALIZER;
++
++void
++panvk_image_ms_lock(void)
++{
++   simple_mtx_lock(&ms_lock);
++}
++
++void
++panvk_image_ms_unlock(void)
++{
++   simple_mtx_unlock(&ms_lock);
++}
++
++VkImage
++panvk_image_get_ms_img_locked(struct panvk_device *dev, struct panvk_image *img,
++                              uint32_t idx)
++{
++   simple_mtx_assert_locked(&ms_lock);
++
++   VkImage ms_img = img->ms_imgs[idx];
++   if (ms_img == VK_NULL_HANDLE || img->ms_mems[idx] != VK_NULL_HANDLE)
++      return ms_img;
++
++   VkDevice device = panvk_device_to_handle(dev);
++   VkImageMemoryRequirementsInfo2 reqs_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++      .image = ms_img,
++   };
++   VkMemoryRequirements2 reqs = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++   };
++   panvk_GetImageMemoryRequirements2(device, &reqs_info, &reqs);
++
++   const VkMemoryAllocateInfo alloc_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.memoryRequirements.size,
++      .memoryTypeIndex = ffs(reqs.memoryRequirements.memoryTypeBits) - 1,
++   };
++   VkDeviceMemory mem;
++   if (panvk_AllocateMemory(device, &alloc_info, NULL, &mem) != VK_SUCCESS)
++      return VK_NULL_HANDLE;
++
++   const VkBindImageMemoryInfo bind_info = {
++      .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
++      .image = ms_img,
++      .memory = mem,
++   };
++   if (panvk_image_bind(dev, &bind_info) != VK_SUCCESS) {
++      panvk_FreeMemory(device, mem, NULL);
++      return VK_NULL_HANDLE;
++   }
++
++   img->ms_mems[idx] = mem;
++   return ms_img;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ panvk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
+                        const VkBindImageMemoryInfo *pBindInfos)
+diff --git a/src/panfrost/vulkan/panvk_image.h b/src/panfrost/vulkan/panvk_image.h
+index 5bcac81..d859e4e 100644
+--- a/src/panfrost/vulkan/panvk_image.h
++++ b/src/panfrost/vulkan/panvk_image.h
+@@ -42,8 +42,13 @@ struct panvk_image {
+    uint8_t plane_count;
+    struct panvk_image_plane planes[PANVK_MAX_PLANES];
+ 
+-   /* One image each for 2x 4x 8x 16x. We don't support more than 16x. */
++   /* One image each for 2x 4x 8x 16x. We don't support more than 16x.
++    * Their memory is driver-owned and only allocated the first time a render
++    * pass uses that sample count (see panvk_image_get_ms_img_locked()), so an
++    * image created with the ms2ss flag doesn't cost 2+4+8+16 extra copies up
++    * front. */
+    VkImage ms_imgs[4];
++   VkDeviceMemory ms_mems[4];
+ 
+    /* If an image can track validity of CRC even when external access is
+     * possible. */
+@@ -276,4 +281,16 @@ panvk_image_plane_crc_header_addr(const struct panvk_image *image)
+           img_plane->plane.layout.slices[0].crc.header_offset_B;
+ }
+ 
++struct panvk_device;
++
++/* Serializes the lazy creation of ms2ss images and views. */
++void panvk_image_ms_lock(void);
++void panvk_image_ms_unlock(void);
++
++/* Returns ms_imgs[idx] with memory bound, allocating it on first use, or
++ * VK_NULL_HANDLE if that sample count isn't supported or allocation failed.
++ * Must be called with panvk_image_ms_lock() held. */
++VkImage panvk_image_get_ms_img_locked(struct panvk_device *dev,
++                                      struct panvk_image *img, uint32_t idx);
++
+ #endif
+diff --git a/src/panfrost/vulkan/panvk_image_view.h b/src/panfrost/vulkan/panvk_image_view.h
+index e4f6c9c..a52044d 100644
+--- a/src/panfrost/vulkan/panvk_image_view.h
++++ b/src/panfrost/vulkan/panvk_image_view.h
+@@ -44,8 +44,12 @@ struct panvk_image_view {
+ #endif
+    } descs;
+ 
+-   /* One image each for 2x 4x 8x 16x. We don't support more than 16x. */
++   /* One image each for 2x 4x 8x 16x. We don't support more than 16x.
++    * Created on first use by panvk_per_arch(image_view_get_ms_view)(), once
++    * the matching ms2ss image has memory, from a copy of the create info. */
+    VkImageView ms_views[4];
++   VkImageViewCreateInfo ms_create_info;
++   VkImageViewUsageCreateInfo ms_usage_info;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_image_view, vk.base, VkImageView,
+@@ -76,4 +80,13 @@ static_assert(offsetof(struct panvk_image_view, descs.zs.tex) ==
+                        offsetof(struct panvk_image_view, descs.tex),
+               "ZS texture descriptor must alias with color texture descriptor");
+ 
++struct panvk_device;
++
++/* The view of the ms2ss image for sample count index idx (0 = 2x, 1 = 4x, ..),
++ * creating it and allocating the image's memory on first use. Returns
++ * VK_NULL_HANDLE if that fails. */
++VkImageView panvk_per_arch(image_view_get_ms_view)(struct panvk_device *dev,
++                                                   struct panvk_image_view *view,
++                                                   uint32_t idx);
++
+ #endif
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 33fcb5b..d66153e 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -64,7 +64,8 @@ vk_to_pan_fb_resolve_mode(VkResolveModeFlagBits resolveMode)
+ }
+ 
+ static struct panvk_image_view *
+-get_ms2ss_image_view(struct panvk_image_view *iview, uint32_t nr_samples)
++get_ms2ss_image_view(struct panvk_cmd_buffer *cmdbuf,
++                     struct panvk_image_view *iview, uint32_t nr_samples)
+ {
+    assert(nr_samples >= 2 && nr_samples <= 16);
+    assert(iview->pview.nr_samples == 1);
+@@ -89,10 +90,18 @@ get_ms2ss_image_view(struct panvk_image_view *iview, uint32_t nr_samples)
+    default:
+       UNREACHABLE("unhandled sample count");
+    }
+-   assert(iview->ms_views[vidx] != VK_NULL_HANDLE);
++   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
++   VkImageView ms_view =
++      panvk_per_arch(image_view_get_ms_view)(dev, iview, vidx);
++
++   /* The multisampled image's memory is allocated here, on first use. If that
++    * fails, fail the command buffer rather than render to a missing image. */
++   if (ms_view == VK_NULL_HANDLE) {
++      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return iview;
++   }
+ 
+-   struct panvk_image_view *res =
+-      panvk_image_view_from_handle(iview->ms_views[vidx]);
++   struct panvk_image_view *res = panvk_image_view_from_handle(ms_view);
+ 
+    assert(res->pview.nr_samples == nr_samples);
+ 
+@@ -148,7 +157,7 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
+ 
+    if (ms2ss) {
+       iview_ss = iview;
+-      iview = get_ms2ss_image_view(iview, render->fb.nr_samples);
++      iview = get_ms2ss_image_view(cmdbuf, iview, render->fb.nr_samples);
+    }
+ 
+    struct panvk_image *img =
+@@ -342,7 +351,7 @@ render_state_set_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
+       z_ms2ss = render->fb.nr_samples > 1 && z_iview->pview.nr_samples == 1;
+       if (z_ms2ss) {
+          z_iview_ss = z_iview;
+-         z_iview = get_ms2ss_image_view(z_iview, render->fb.nr_samples);
++         z_iview = get_ms2ss_image_view(cmdbuf, z_iview, render->fb.nr_samples);
+       }
+ 
+       render->bound_attachments |= MESA_VK_RP_ATTACHMENT_DEPTH_BIT;
+@@ -366,7 +375,7 @@ render_state_set_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
+       s_ms2ss = render->fb.nr_samples > 1 && s_iview->pview.nr_samples == 1;
+       if (s_ms2ss) {
+          s_iview_ss = s_iview;
+-         s_iview = get_ms2ss_image_view(s_iview, render->fb.nr_samples);
++         s_iview = get_ms2ss_image_view(cmdbuf, s_iview, render->fb.nr_samples);
+       }
+ 
+       render->bound_attachments |= MESA_VK_RP_ATTACHMENT_STENCIL_BIT;
+diff --git a/src/panfrost/vulkan/panvk_vX_image_view.c b/src/panfrost/vulkan/panvk_vX_image_view.c
+index 994dda8..e611422 100644
+--- a/src/panfrost/vulkan/panvk_vX_image_view.c
++++ b/src/panfrost/vulkan/panvk_vX_image_view.c
+@@ -286,35 +286,63 @@ get_yuv_cr_siting(const struct vk_ycbcr_conversion_state *conv)
+ }
+ 
+ static void
+-create_ms_views(struct panvk_device *dev, struct panvk_image_view *view,
+-                const VkImageViewCreateInfo *pCreateInfo,
+-                const VkAllocationCallbacks *pAllocator)
++save_ms_view_info(struct panvk_image_view *view,
++                  const VkImageViewCreateInfo *pCreateInfo)
+ {
+    /* Don't create extra views for internal views. */
+    if (pCreateInfo->flags & VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA)
+       return;
+ 
+-   struct panvk_image *source_img =
+-      panvk_image_from_handle(vk_image_to_handle(view->vk.image));
+-   const VkImage *target_images = source_img->ms_imgs;
++   /* The ms views are created on first use (the ms2ss images only get memory
++    * then, and views bake image addresses into their descriptors). Keep what
++    * creating them needs: the create info and, if given, the usage
++    * restriction. Other extension structs don't apply to ms2ss images. */
++   view->ms_create_info = *pCreateInfo;
++   view->ms_create_info.pNext = NULL;
++
++   const VkImageViewUsageCreateInfo *usage_info =
++      vk_find_struct_const(pCreateInfo->pNext, IMAGE_VIEW_USAGE_CREATE_INFO);
++   if (usage_info) {
++      view->ms_usage_info = *usage_info;
++      view->ms_usage_info.pNext = NULL;
++      view->ms_create_info.pNext = &view->ms_usage_info;
++   }
++}
+ 
+-   VkImageViewCreateInfo create_info = *pCreateInfo;
++VkImageView
++panvk_per_arch(image_view_get_ms_view)(struct panvk_device *dev,
++                                       struct panvk_image_view *view,
++                                       uint32_t idx)
++{
++   struct panvk_image *img =
++      container_of(view->vk.image, struct panvk_image, vk);
+ 
+-   for (uint32_t idx = 0; idx < ARRAY_SIZE(source_img->ms_imgs); ++idx) {
+-      if (target_images[idx] == VK_NULL_HANDLE)
+-         continue;
++   panvk_image_ms_lock();
+ 
+-      create_info.image = target_images[idx];
++   if (view->ms_views[idx] == VK_NULL_HANDLE &&
++       view->ms_create_info.sType == VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO) {
++      VkImage ms_img = panvk_image_get_ms_img_locked(dev, img, idx);
+ 
+-      assert(vk_image_from_handle(create_info.image)->format ==
+-             source_img->vk.format);
+-      assert(view->vk.format == create_info.format);
+-      assert(!(vk_image_from_handle(create_info.image)->create_flags &
+-               VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT));
++      if (ms_img != VK_NULL_HANDLE) {
++         VkImageViewCreateInfo create_info = view->ms_create_info;
++         create_info.image = ms_img;
+ 
+-      panvk_per_arch(CreateImageView)(panvk_device_to_handle(dev), &create_info,
+-                                      pAllocator, &view->ms_views[idx]);
++         assert(vk_image_from_handle(ms_img)->format == img->vk.format);
++         assert(!(vk_image_from_handle(ms_img)->create_flags &
++                  VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT));
++
++         /* Device allocator: the app's allocator for the parent view may not
++          * be the one it passes to vkDestroyImageView. */
++         if (panvk_per_arch(CreateImageView)(panvk_device_to_handle(dev),
++                                             &create_info, NULL,
++                                             &view->ms_views[idx]) != VK_SUCCESS)
++            view->ms_views[idx] = VK_NULL_HANDLE;
++      }
+    }
++
++   VkImageView res = view->ms_views[idx];
++   panvk_image_ms_unlock();
++   return res;
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+@@ -471,7 +499,7 @@ panvk_per_arch(CreateImageView)(VkDevice _device,
+ 
+    if (view->vk.image->create_flags &
+        VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT)
+-      create_ms_views(device, view, pCreateInfo, pAllocator);
++      save_ms_view_info(view, pCreateInfo);
+ 
+    *pView = panvk_image_view_to_handle(view);
+    return VK_SUCCESS;
+@@ -492,8 +520,7 @@ panvk_per_arch(DestroyImageView)(VkDevice _device, VkImageView _view,
+       return;
+ 
+    for (uint32_t i = 0; i < ARRAY_SIZE(view->ms_views); ++i) {
+-      panvk_per_arch(DestroyImageView)(_device, view->ms_views[i],
+-                                       pAllocator);
++      panvk_per_arch(DestroyImageView)(_device, view->ms_views[i], NULL);
+    }
+ 
+    panvk_pool_free_mem(&view->mem);
+-- 
+2.55.0
+
