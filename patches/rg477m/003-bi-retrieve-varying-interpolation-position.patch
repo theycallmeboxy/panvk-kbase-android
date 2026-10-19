@@ -11,6 +11,13 @@ fragment shader reading two varyings serializes them. Within a block,
 once a load has stored the position for a sample mode, later loads with
 the same mode can use .retrieve: no recompute and no wait.
 
+The pass runs on the final instruction order, after scheduling, register
+allocation and the post-RA cleanups: varying loads carry no ordering
+dependencies, so the pre-RA schedulers may move a retrieving load above
+the load that stores the position (it then interpolates at a stale
+position: Batman: Arkham Asylum's title and menu backgrounds came out as
+blocky noise), and DCE may delete the storing load.
+
 On Mali-G615, 32 layers of blended full-screen quads whose shader reads
 UV + colour: 2.01 ms -> 1.35 ms (DDK 1.26 ms). Output bit-identical.
 BIFROST_MESA_DEBUG=noretrieve disables the pass.
@@ -23,13 +30,13 @@ Upstream-commit: none (upstream Mesa also emits .store on every load)
 Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none
-Validation test: blended full-screen quads reading UV + colour 2.01 -> 1.35 ms (DDK 1.26), framebuffer checksums identical with and without the pass; PanProbe 38/38
+Validation test: blended full-screen quads reading UV + colour 2.01 -> 1.35 ms (DDK 1.26), framebuffer checksums identical with and without the pass; PanProbe 38/38. 2026-10-19: pass moved after scheduling/RA; Batman: Arkham Asylum's title and menu backgrounds (blocky noise before, correct on the stock driver and with noretrieve) now render correctly; drawbench fill 32 with UV + colour 1.65 ms (2.50 with noretrieve), drawbench 6 tests' checksums and racetest 5 modes identical to the previous build, PanProbe 38/38
 Generated-by: LLM
 ---
  src/panfrost/compiler/bifrost/bi_debug.c      |  1 +
  src/panfrost/compiler/bifrost/bi_debug.h      |  1 +
- .../compiler/bifrost/bifrost_compile.c        | 70 +++++++++++++++++++
- 3 files changed, 72 insertions(+)
+ .../compiler/bifrost/bifrost_compile.c        | 74 +++++++++++++++++++
+ 3 files changed, 76 insertions(+)
 
 diff --git a/src/panfrost/compiler/bifrost/bi_debug.c b/src/panfrost/compiler/bifrost/bi_debug.c
 index 6e99189..230516f 100644
@@ -56,7 +63,7 @@ index 3360e23..cf5cfe6 100644
  extern unsigned bifrost_debug;
  
 diff --git a/src/panfrost/compiler/bifrost/bifrost_compile.c b/src/panfrost/compiler/bifrost/bifrost_compile.c
-index d7adf88..c6692a6 100644
+index d7adf88..15a8152 100644
 --- a/src/panfrost/compiler/bifrost/bifrost_compile.c
 +++ b/src/panfrost/compiler/bifrost/bifrost_compile.c
 @@ -602,6 +602,72 @@ bi_emit_load_var(bi_builder *b, nir_intrinsic_instr *intr)
@@ -132,17 +139,21 @@ index d7adf88..c6692a6 100644
  static void
  bi_emit_load_var_buf(bi_builder *b, nir_intrinsic_instr *intr)
  {
-@@ -4363,6 +4429,10 @@ bi_compile_variant_nir(nir_shader *nir,
-       va_lower_isel(ctx);
-       va_optimize(ctx);
+@@ -4469,6 +4535,14 @@ bi_compile_variant_nir(nir_shader *nir,
+    bi_opt_control_flow(ctx);
  
+    if (ctx->arch >= 9) {
++      /* Only valid on the final instruction order: varying loads carry no
++       * ordering dependencies, so the schedulers may move a retrieving load
++       * above the load that stores the position, and DCE may delete the
++       * storing load. Run after scheduling, RA and the post-RA cleanups. */
 +      if (ctx->stage == MESA_SHADER_FRAGMENT &&
 +          !(bifrost_debug & BIFROST_DBG_NORETRIEVE))
 +         va_retrieve_varying_position(ctx);
 +
-       /* Count how often a specific constant appears. */
-       struct hash_table_u64 *const_hist = _mesa_hash_table_u64_create(ctx);
-       bi_foreach_instr_global_safe(ctx, I) {
+       va_assign_slots(ctx);
+       va_insert_flow_control_nops(ctx);
+       va_merge_flow(ctx);
 -- 
 2.55.0
 
