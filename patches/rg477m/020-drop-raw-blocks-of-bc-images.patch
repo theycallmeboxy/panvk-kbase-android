@@ -1,0 +1,322 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:30:06 -0400
+Subject: [PATCH] panvk: drop the raw blocks of fragment-decoded BC images
+
+A BC image on hardware without BC texturing kept two copies: the raw
+blocks in planes[0] and the decoded texels that sampled views read. On the
+fragment-decode path the raw blocks are only read again for copies out of
+the image: uploads decode straight from the source buffer. Keeping them
+costs 25-50% of every BC texture's memory, which decides whether a game
+fits on an 8 GB device: Risk of Rain 2 had 0.88 GB of raw blocks next to
+1.92 GB of decoded texels when it ran out of memory.
+
+Images on the fragment path now take only the decoded copy's memory
+(bc_decoded at offset 0; planes[0] aliases it and is never written).
+Uploads skip the raw copy, copies between BC images copy decoded texels
+(whole levels byte for byte, exact; partial regions by a nearest blit of
+the shadow images, which re-encodes AFRC),
+copies into such an image from a BC image with raw blocks decode from the
+source's blocks, and zero-initialized images need no decode. Reading the
+blocks back (copies to memory or to non-BC images) is not possible; it is
+skipped with a one-time warning. Images the app may view or map as blocks
+keep them: linear tiling, BLOCK_TEXEL_VIEW_COMPATIBLE, sparse, alias and
+disjoint. PANVK_BC_DROP_RAW=0 restores the old layout (PanProbe's
+bc_decode raw-readback check fails with the default; its copy and blit
+checks pass for all 16 BC formats).
+
+2048x2048 with mips: BC1 8.0 -> 5.3 MiB, BC3 16.0 -> 10.7 MiB, BC7
+10.7 -> 5.3 MiB (native size). Risk of Rain 2 now reaches its main menu
+(peak 3.4 GB instead of running out after the intro); 15 other games boot
+with no skipped copies.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Purpose: stop keeping the raw BCn blocks of fragment-decoded BC images (only the decoded copy is sampled); cuts 25-50% of every BC texture's GPU memory on Mali without BC texturing
+Upstream-commit: none (zenithblue BC emulation, csf/common; upstream candidate for zenithblue-oss)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: zenithblue's BC emulation (bc_gfx fragment-decode path); applies on the full g615-v11-csf series after rg477m/019
+Validation test: per-texture memory 2048x2048 with mips BC1 8.0 -> 5.3 MiB, BC3 16.0 -> 10.7, BC5 16.6 -> 11.2, BC7 10.7 -> 5.3 (bcsize); Risk of Rain 2 raw blocks 0.88 GB -> 0, reaches its main menu (peak 3.4 GB) instead of running out of memory after the intro; 15-game boot sweep with no skipped copies and no GPU faults; Arkham Asylum gameplay unchanged (24 fps, renders correctly); Gladius 2/2; PanProbe 37/38: bc_decode copy and blit exact for all 16 BC formats, its raw-readback check fails by design (PANVK_BC_DROP_RAW=0 passes it); drawbench 6 checksums and racetest 4 modes identical to the previous build
+Generated-by: LLM
+---
+ src/panfrost/vulkan/panvk_image.c       |  15 ++-
+ src/panfrost/vulkan/panvk_image.h       |   6 +
+ src/panfrost/vulkan/panvk_vX_cmd_meta.c | 169 +++++++++++++++++++++++-
+ 3 files changed, 187 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index 9b6e8e5..b488b87 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -606,7 +606,8 @@ panvk_image_init_layouts(struct panvk_image *image,
+ 
+       image->bc_decoded = tmp.planes[0];
+       image->bc_decoded.image.planes[0] = &image->bc_decoded.plane;
+-      image->bc_decoded_offset = ALIGN_POT(plane_layout.offset_B, 4096);
++      image->bc_decoded_offset =
++         image->bc_noraw ? 0 : ALIGN_POT(plane_layout.offset_B, 4096);
+    } else if (image->bc_emul) {
+       struct pan_image *dec = &image->bc_decoded.image;
+       enum pipe_format dec_pfmt = vk_format_to_pipe_format(image->bc_format);
+@@ -709,6 +710,9 @@ static uint64_t
+ panvk_image_get_total_size(const struct panvk_image *image)
+ {
+    uint64_t size = 0;
++   /* bc_noraw: planes[0] aliases the start of the decoded copy and is never
++    * written; it still bounds the size so stray raw-plane reads stay inside
++    * the allocation. */
+    for (uint8_t plane = 0; plane < image->plane_count; plane++)
+       size = MAX2(size, panvk_image_plane_size(image, plane));
+    if (image->bc_emul) {
+@@ -768,6 +772,15 @@ panvk_image_init(struct panvk_image *image,
+                    pan_arch(phys_dev->kmod.dev->props.gpu_id) >= 10 &&
+                    image->vk.image_type == VK_IMAGE_TYPE_2D &&
+                    !PANVK_DEBUG(BC_COMPUTE) && !PANVK_DEBUG(NO_GS);
++   /* On by default (PANVK_BC_DROP_RAW=0 keeps the raw blocks). Images the app may
++    * view or map as raw blocks keep them. */
++   image->bc_noraw =
++      image->bc_gfx && debug_get_bool_option("PANVK_BC_DROP_RAW", true) &&
++      pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
++      !(pCreateInfo->flags & (VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
++                              VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
++                              VK_IMAGE_CREATE_ALIAS_BIT |
++                              VK_IMAGE_CREATE_DISJOINT_BIT));
+    if (image->bc_emul) {
+       image->bc_format =
+          image->bc_gfx
+diff --git a/src/panfrost/vulkan/panvk_image.h b/src/panfrost/vulkan/panvk_image.h
+index d859e4e..149c7bc 100644
+--- a/src/panfrost/vulkan/panvk_image.h
++++ b/src/panfrost/vulkan/panvk_image.h
+@@ -64,6 +64,12 @@ struct panvk_image {
+     * formats. Otherwise bc_decoded is LINEAR and written by compute. */
+    bool bc_emul;
+    bool bc_gfx;
++   /* bc_gfx without the raw blocks: bc_decoded sits at offset 0 and the
++    * image only takes the decoded copy's memory. Uploads decode straight
++    * from the source buffer, BC-to-BC copies copy decoded texels; reading the
++    * blocks back (copies to memory or to uncompressed images) is not
++    * possible and is skipped with a warning. */
++   bool bc_noraw;
+    VkFormat bc_format;
+    struct panvk_image_plane bc_decoded;
+    uint64_t bc_decoded_offset;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index 3878a37..b6fb450 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -887,6 +887,8 @@ bc_decode_region_gfx(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+    disp->CmdEndRendering(cmd);
+ }
+ 
++static void bc_noraw_warn_once(const char *what);
++
+ /* Source of a decode that reads the raw plane of img itself. */
+ static struct bc_decode_src
+ bc_raw_plane_src(const struct panvk_image *img,
+@@ -1063,7 +1065,7 @@ panvk_per_arch(cmd_bc_decode_zero_initialized)(
+ 
+          if (b->oldLayout != VK_IMAGE_LAYOUT_ZERO_INITIALIZED_EXT ||
+              b->newLayout == VK_IMAGE_LAYOUT_ZERO_INITIALIZED_EXT ||
+-             !img->bc_gfx)
++             !img->bc_gfx || img->bc_noraw)
+             continue;
+ 
+          const uint32_t level_count =
+@@ -1117,7 +1119,8 @@ panvk_per_arch(CmdCopyMemoryToImageKHR)(
+       struct panvk_cmd_meta_graphics_save_ctx save = {0};
+       const uint32_t blk_B = vk_format_get_blocksize(bc_img->vk.format);
+ 
+-      copy_memory_to_image_raw(commandBuffer, pCopyMemoryInfo);
++      if (!bc_img->bc_noraw)
++         copy_memory_to_image_raw(commandBuffer, pCopyMemoryInfo);
+ 
+       /* Decode straight from the copy source: the raw copy (compute) and
+        * the decode (fragment) only share reads, so no barrier between them.
+@@ -1228,6 +1231,11 @@ panvk_per_arch(CmdCopyImageToMemoryKHR)(
+       return;
+    }
+ 
++   if (img->bc_noraw) {
++      bc_noraw_warn_once("copy to memory");
++      return;
++   }
++
+    struct vk_meta_copy_image_properties img_props =
+       panvk_meta_copy_get_image_properties(img, false, false);
+    struct panvk_cmd_meta_compute_save_ctx save = {0};
+@@ -1377,6 +1385,158 @@ lower_copy_image(VkCommandBuffer commandBuffer,
+    return true;
+ }
+ 
++
++static void
++bc_noraw_warn_once(const char *what)
++{
++   static bool warned;
++   if (!p_atomic_xchg(&warned, true))
++      mesa_logw("panvk: %s from a BC image without raw blocks "
++                "(PANVK_BC_DROP_RAW) is not supported, skipped", what);
++}
++
++/* Copy the decoded texels of BC images. A region covering a whole level of
++ * the same size on both sides copies the decoded plane's bytes: AFRC is fixed
++ * rate and the decoded layouts match, so the copy is exact (engines stream
++ * mips this way). Other regions take a nearest-filter blit between the
++ * bc_shadow images, which re-encodes AFRC and so is close but not exact;
++ * regions are clamped to both levels' extents (compressed copy extents may
++ * round up to whole blocks). */
++static void
++bc_copy_decoded(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *info,
++                struct panvk_image *src, struct panvk_image *dst)
++{
++   STACK_ARRAY(VkImageBlit2, blits, info->regionCount);
++   uint32_t n = 0;
++   const bool same_layout =
++      src->bc_format == dst->bc_format &&
++      src->bc_decoded.image.props.modifier ==
++         dst->bc_decoded.image.props.modifier;
++
++   for (uint32_t i = 0; i < info->regionCount; i++) {
++      const VkImageCopy2 *r = &info->pRegions[i];
++      const VkExtent3D se =
++         vk_image_mip_level_extent(&src->vk, r->srcSubresource.mipLevel);
++      const VkExtent3D de =
++         vk_image_mip_level_extent(&dst->vk, r->dstSubresource.mipLevel);
++
++      if (same_layout && se.width == de.width && se.height == de.height &&
++          !r->srcOffset.x && !r->srcOffset.y && !r->dstOffset.x &&
++          !r->dstOffset.y && r->extent.width >= se.width &&
++          r->extent.height >= se.height) {
++         const struct pan_image_layout *sl = &src->bc_decoded.plane.layout;
++         const struct pan_image_layout *dl = &dst->bc_decoded.plane.layout;
++         const struct pan_image_slice_layout *ss =
++            &sl->slices[r->srcSubresource.mipLevel];
++         const struct pan_image_slice_layout *ds =
++            &dl->slices[r->dstSubresource.mipLevel];
++         const uint32_t layers =
++            r->srcSubresource.layerCount == VK_REMAINING_ARRAY_LAYERS
++               ? src->vk.array_layers - r->srcSubresource.baseArrayLayer
++               : r->srcSubresource.layerCount;
++
++         if (ss->size_B == ds->size_B) {
++            STACK_ARRAY(VkDeviceMemoryCopyKHR, mc, layers);
++            for (uint32_t l = 0; l < layers; l++) {
++               mc[l] = (VkDeviceMemoryCopyKHR){
++                  .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_COPY_KHR,
++                  .srcRange = {src->bc_decoded.plane.base + ss->offset_B +
++                                  (r->srcSubresource.baseArrayLayer + l) *
++                                     sl->array_stride_B,
++                               ss->size_B},
++                  .dstRange = {dst->bc_decoded.plane.base + ds->offset_B +
++                                  (r->dstSubresource.baseArrayLayer + l) *
++                                     dl->array_stride_B,
++                               ds->size_B},
++               };
++            }
++            const VkCopyDeviceMemoryInfoKHR copy = {
++               .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_INFO_KHR,
++               .regionCount = layers,
++               .pRegions = mc,
++            };
++            panvk_per_arch(CmdCopyMemoryKHR)(commandBuffer, &copy);
++            STACK_ARRAY_FINISH(mc);
++            continue;
++         }
++      }
++      const int32_t w = MIN3((int32_t)r->extent.width,
++                             (int32_t)se.width - r->srcOffset.x,
++                             (int32_t)de.width - r->dstOffset.x);
++      const int32_t h = MIN3((int32_t)r->extent.height,
++                             (int32_t)se.height - r->srcOffset.y,
++                             (int32_t)de.height - r->dstOffset.y);
++
++      if (w <= 0 || h <= 0)
++         continue;
++
++      blits[n++] = (VkImageBlit2){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
++         .srcSubresource = r->srcSubresource,
++         .srcOffsets = {r->srcOffset,
++                        {r->srcOffset.x + w, r->srcOffset.y + h, 1}},
++         .dstSubresource = r->dstSubresource,
++         .dstOffsets = {r->dstOffset,
++                        {r->dstOffset.x + w, r->dstOffset.y + h, 1}},
++      };
++   }
++
++   if (n) {
++      const VkBlitImageInfo2 blit = {
++         .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
++         .srcImage = src->bc_shadow,
++         .srcImageLayout = info->srcImageLayout,
++         .dstImage = dst->bc_shadow,
++         .dstImageLayout = info->dstImageLayout,
++         .regionCount = n,
++         .pRegions = blits,
++         .filter = VK_FILTER_NEAREST,
++      };
++      panvk_per_arch(CmdBlitImage2)(commandBuffer, &blit);
++   }
++   STACK_ARRAY_FINISH(blits);
++}
++
++/* CmdCopyImage2 when either image is a bc_noraw image. */
++static void
++copy_image_bc_noraw(VkCommandBuffer commandBuffer,
++                    const VkCopyImageInfo2 *info)
++{
++   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++   VK_FROM_HANDLE(panvk_image, src, info->srcImage);
++   VK_FROM_HANDLE(panvk_image, dst, info->dstImage);
++   const bool src_blocks = vk_format_is_compressed(src->vk.format);
++
++   if (src->bc_noraw) {
++      /* Only the decoded texels exist: they can go to another decoded
++       * copy, never back to blocks. */
++      if (dst->bc_gfx)
++         bc_copy_decoded(commandBuffer, info, src, dst);
++      else
++         bc_noraw_warn_once("copy to a non-BC or compute-decoded image");
++      return;
++   }
++
++   /* dst has no raw plane: decode straight from the source's blocks. */
++   if (!src_blocks || !src->bc_emul) {
++      bc_noraw_warn_once("copy from an uncompressed image into one");
++      return;
++   }
++
++   struct panvk_cmd_meta_graphics_save_ctx save = {0};
++
++   meta_gfx_start(cmdbuf, &save);
++   for (uint32_t i = 0; i < info->regionCount; i++) {
++      const VkImageCopy2 *r = &info->pRegions[i];
++      const struct bc_decode_src s =
++         bc_raw_plane_src(src, &r->srcSubresource, r->srcOffset);
++
++      bc_decode_region_gfx(cmdbuf, dst, &r->dstSubresource, r->dstOffset,
++                           r->extent, &s);
++   }
++   meta_gfx_end(cmdbuf, &save);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
+                               const VkCopyImageInfo2 *pCopyImageInfo)
+@@ -1384,6 +1544,11 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_image, bc_src, pCopyImageInfo->srcImage);
+    VK_FROM_HANDLE(panvk_image, bc_dst, pCopyImageInfo->dstImage);
+ 
++   if (bc_src->bc_noraw || bc_dst->bc_noraw) {
++      copy_image_bc_noraw(commandBuffer, pCopyImageInfo);
++      return;
++   }
++
+    copy_image_raw(commandBuffer, pCopyImageInfo);
+ 
+    if (!bc_dst->bc_emul)
+-- 
+2.55.0
+
