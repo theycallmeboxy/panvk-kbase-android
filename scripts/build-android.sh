@@ -1,11 +1,11 @@
 #!/bin/sh
 # build-android.sh — Android/Bionic arm64-v8a PanVK (hot-loadable ICD + Android/X11 WSI + AHB + Kbase)
-# Usage: ./scripts/build-android.sh --profile g615-v11-csf [--api 35] [--ndk $ANDROID_NDK_ROOT]
+# Usage: ./scripts/build-android.sh --profile g615-v11-csf [--api 35] [--ndk $ANDROID_NDK_ROOT] [--panvk-profile compat|fast]
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PROFILE=""; API="${ANDROID_API:-35}"; NDK="${ANDROID_NDK_ROOT:-${ANDROID_HOME:-/opt/android-sdk}/ndk}"
+PROFILE=""; PANVK_PROFILE=""; API="${ANDROID_API:-35}"; NDK="${ANDROID_NDK_ROOT:-${ANDROID_HOME:-/opt/android-sdk}/ndk}"
 while [ $# -gt 0 ]; do case "$1" in
-  --profile) PROFILE="$2"; shift 2;; --api) API="$2"; shift 2;; --ndk) NDK="$2"; shift 2;; *) echo "unknown $1" >&2; exit 2;; esac; done
+  --profile) PROFILE="$2"; shift 2;; --panvk-profile) PANVK_PROFILE="$2"; shift 2;; --api) API="$2"; shift 2;; --ndk) NDK="$2"; shift 2;; *) echo "unknown $1" >&2; exit 2;; esac; done
 [ -n "$PROFILE" ] || { echo "--profile required" >&2; exit 2; }
 NDK_BIN="$(ls -d "$NDK"/*/toolchains/llvm/prebuilt/linux-x86_64/bin 2>/dev/null | sort -V | tail -n1)"
 if [ -z "$NDK_BIN" ]; then NDK_BIN="$(ls -d "$NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin 2>/dev/null | head -n1)"; fi
@@ -44,6 +44,8 @@ export PKG_CONFIG_PATH="$DEPS_PCDIR:${PKG_CONFIG_PATH:-}"
 mkdir -p "$DDIR"
 # Host codegen tools (mesa_clc, vtn_bindgen2, panfrost_compile) must come from a native build:
 # default is derived from MESA (see bootstrap-host-tools.sh) and HOST_TOOLS overrides it.
+# rg477m: compiled-in defaults of trade-off switches (meson option panvk-profile, rg477m/022); unset = Mesa default
+PANVK_OPT=""; [ -n "$PANVK_PROFILE" ] && PANVK_OPT="-Dpanvk-profile=$PANVK_PROFILE"
 LOG="$BDIR.log"; RECONF=""; [ -f "$BDIR/build.ninja" ] && RECONF="--reconfigure"
 meson setup $RECONF "$BDIR" "$MESA" --cross-file "$BDIR.cross.ini" \
   -Dbuildtype=release -Dplatforms=android,x11 -Dandroid-stub=true -Dandroid-strict=false \
@@ -51,9 +53,9 @@ meson setup $RECONF "$BDIR" "$MESA" --cross-file "$BDIR.cross.ini" \
   -Dmesa-clc=system -Dprecomp-compiler=system -Dxlib-lease=disabled \
   -Degl=disabled -Dgles1=disabled -Dgles2=disabled -Dopengl=false \
   -Dglx=disabled -Dgbm=disabled -Dlibunwind=disabled -Dzstd=disabled \
-  -Dcpp_link_args=-static-libstdc++ >"$LOG" 2>&1 || { tail -n 20 "$LOG"; echo "BUILD-FAIL: meson setup (log $LOG)" >&2; exit 1; }
+  -Dcpp_link_args=-static-libstdc++ $PANVK_OPT >"$LOG" 2>&1 || { tail -n 20 "$LOG"; echo "BUILD-FAIL: meson setup (log $LOG)" >&2; exit 1; }
 ninja -j"$(nproc)" -C "$BDIR" >>"$LOG" 2>&1 || { tail -n 20 "$LOG"; echo "BUILD-FAIL: ninja (log $LOG)" >&2; exit 1; }
 SO="$(find "$BDIR" -name libvulkan_panfrost.so | head -n1)"
 [ -n "$SO" ] || { echo "BUILD-FAIL: libvulkan_panfrost.so not produced" >&2; exit 1; }
 cp "$SO" "$DDIR/"
-echo "OK profile=$PROFILE so=$DDIR/libvulkan_panfrost.so"
+echo "OK profile=$PROFILE${PANVK_PROFILE:+ panvk-profile=$PANVK_PROFILE} so=$DDIR/libvulkan_panfrost.so"

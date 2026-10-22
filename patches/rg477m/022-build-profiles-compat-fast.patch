@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:22:18 -0400
+Subject: [PATCH] panvk: add a compat/fast build profile for the defaults of
+ trade-off switches
+
+Some switches trade valid but rarely used Vulkan behaviour for memory or
+speed. They stay off by default, so a build that should have them on
+needed an environment variable per game.
+
+New meson option panvk-profile (compat or fast, default compat). It sets
+PANVK_PROFILE_FAST, the compiled-in default of such switches; the
+environment variable still overrides it per process in either build.
+driverInfo names the profile ("PanVK-kbase RC3-lowmem fast (Mesa ...)").
+
+compat: every default is conformant (PanProbe 38/38).
+fast: also PANVK_BC_DROP_RAW (rg477m/020): BC images on the fragment-decode
+path keep no raw blocks, 25-50% less texture memory; reading the blocks
+back is skipped with a warning, so PanProbe's bc_decode raw-readback check
+fails (37/38).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: build profiles: meson option panvk-profile=compat|fast sets the compiled-in default of switches that trade conformance for memory or speed (fast: PANVK_BC_DROP_RAW on); env variables still override per process; driverInfo names the profile. Fork scripts/build-android.sh passes it with --panvk-profile
+Upstream-commit: none (fork build option)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/020 (PANVK_BC_DROP_RAW); applies on the full g615-v11-csf series after rg477m/021
+Validation test: PanProbe compat 38/38 x2, fast 37/38 x2 (only bc_decode raw readback fails, by design); bcsize 2048x2048 BC1/BC3 per build and env: compat 8.0/16.0 MiB, compat PANVK_BC_DROP_RAW=1 5.3/10.7, fast 5.3/10.7, fast PANVK_BC_DROP_RAW=0 8.0/16.0; driverInfo "PanVK-kbase RC3-lowmem compat|fast (Mesa ...)"; Arkham Asylum (32-bit, rg477m/021 path active) on fast: 3/3 to gameplay with a checkpoint reload, no specks, 0 GPU faults, 25.0-26.7 fps; Arkham converts its textures to ASTC in GameNative, so 020 is inactive there
+Generated-by: LLM
+---
+ meson.options                                  | 11 +++++++++++
+ src/panfrost/vulkan/meson.build                |  2 ++
+ src/panfrost/vulkan/panvk_image.c              |  6 +++---
+ src/panfrost/vulkan/panvk_vX_physical_device.c |  4 ++--
+ 4 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/meson.options b/meson.options
+index 36e090c..8f26085 100644
+--- a/meson.options
++++ b/meson.options
+@@ -236,6 +236,17 @@ option(
+                 'gallium and vulkan driver',
+ )
+ 
++option(
++  'panvk-profile',
++  type : 'combo',
++  value : 'compat',
++  choices : ['compat', 'fast'],
++  description : 'Compiled-in defaults of PanVK-kbase switches. compat: only ' +
++                'conformant behaviour. fast: also enables tested trade-offs ' +
++                'that break rarely used valid Vulkan (each switch can still ' +
++                'be set per process with its environment variable).',
++)
++
+ option(
+   'amdgpu-virtio',
+   type : 'boolean',
+diff --git a/src/panfrost/vulkan/meson.build b/src/panfrost/vulkan/meson.build
+index 437a8e7..55181b3 100644
+--- a/src/panfrost/vulkan/meson.build
++++ b/src/panfrost/vulkan/meson.build
+@@ -70,6 +70,8 @@ libpanvk_files += [sha1_h]
+ 
+ panvk_deps = []
+ panvk_flags = []
++# compat or fast: the compiled-in default of switches that trade conformance for memory or speed
++panvk_flags += '-DPANVK_PROFILE_FAST=@0@'.format(get_option('panvk-profile') == 'fast' ? 1 : 0)
+ panvk_per_arch_libs = []
+ 
+ bifrost_archs = [6, 7]
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index 1eb7e2e..399fbd8 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -772,10 +772,10 @@ panvk_image_init(struct panvk_image *image,
+                    pan_arch(phys_dev->kmod.dev->props.gpu_id) >= 10 &&
+                    image->vk.image_type == VK_IMAGE_TYPE_2D &&
+                    !PANVK_DEBUG(BC_COMPUTE) && !PANVK_DEBUG(NO_GS);
+-   /* Opt-in (PANVK_BC_DROP_RAW=1): reading the blocks back breaks, so it stays off by default. Images the app may
+-    * view or map as raw blocks keep them. */
++   /* PANVK_BC_DROP_RAW: reading the blocks back breaks, so it is off by default except in the fast build profile.
++    * Images the app may view or map as raw blocks keep them. */
+    image->bc_noraw =
+-      image->bc_gfx && debug_get_bool_option("PANVK_BC_DROP_RAW", false) &&
++      image->bc_gfx && debug_get_bool_option("PANVK_BC_DROP_RAW", PANVK_PROFILE_FAST) &&
+       pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
+       !(pCreateInfo->flags & (VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
+                               VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 802118c..d5f7db8 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -1392,8 +1392,8 @@ panvk_per_arch(get_physical_device_properties)(
+ 
+    snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "panvk");
+    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
+-            "PanVK-kbase " PANVK_KBASE_RELEASE " (Mesa " PACKAGE_VERSION
+-            MESA_GIT_SHA1 ")");
++            "PanVK-kbase " PANVK_KBASE_RELEASE " %s (Mesa " PACKAGE_VERSION
++            MESA_GIT_SHA1 ")", PANVK_PROFILE_FAST ? "fast" : "compat");
+ 
+    /* VK_EXT_physical_device_drm */
+    if (device->drm.primary_rdev) {
+-- 
+2.55.0
+
