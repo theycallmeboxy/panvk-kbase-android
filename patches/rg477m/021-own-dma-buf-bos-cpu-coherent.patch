@@ -7,8 +7,9 @@ Subject: [PATCH] panfrost/kbase: keep the driver's own never-exported dma-buf
 With a dma-heap available, kbase_kmod_bo_alloc() backs every BO without an
 exclusive VM with a dma-heap buffer that it imports through
 kbase_kmod_import_dmabuf(). Besides exportable memory, that covers
-host-visible memory when memoryMapPlaced is enabled, which Proton's arm64ec
-build uses for DXVK's staging buffers. "import dma-bufs inner-shareable"
+host-visible memory when memoryMapPlaced is enabled, which Wine's Vulkan
+layer does for 32-bit (WoW64) processes; DXVK's staging buffers in 32-bit
+games land there. "import dma-bufs inner-shareable"
 made all of these imports COHERENT_LOCAL, so the GPU stopped snooping the
 CPU's cached dma-buf mapping: CPU writes still in the cache reach GPU copies
 as zeros. In Batman: Arkham Asylum, whose DXT textures GameNative transcodes
@@ -24,18 +25,19 @@ PANVK_KBASE_PRIVATE_LOCAL=1 keeps the old behaviour.
 Arkham Asylum, launch + checkpoint restart, interleaved, same build:
 specks in 0/9 valid runs (fix) vs 6/7 (PANVK_KBASE_PRIVATE_LOCAL=1), 10
 rounds each; with a CPU wait after each submit, uploaded ASTC mips with
-missing blocks 0/11006 vs 91-219 per launch. No GPU faults in any run;
-PanProbe 38/38 x3.
+missing blocks 0 of 11006 vs 310 of 11005 in one launch. No GPU faults;
+PanProbe 38/38 x3. Frame rate at 1255 MHz unchanged: Arkham 25.35 vs
+25.15 fps; 64-bit Hades (no placed maps, untouched) 227.7 vs 228.5.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
 
-Purpose: fix magenta specks / zero blocks in uploaded textures (Arkham Asylum) caused by rg477m/001: the driver's own never-exported dma-heap BOs (placed-map host memory, DXVK staging under Proton arm64ec) were imported inner-shareable, so the GPU did not snoop the CPU's cached writes; import those COHERENT_SYSTEM again (PANVK_KBASE_PRIVATE_LOCAL=1 reverts)
+Purpose: fix magenta specks / zero blocks in uploaded textures (Arkham Asylum) caused by rg477m/001: the driver's own never-exported dma-heap BOs (placed-map host memory, DXVK staging in 32-bit/WoW64 games) were imported inner-shareable, so the GPU did not snoop the CPU's cached writes; import those COHERENT_SYSTEM again (PANVK_KBASE_PRIVATE_LOCAL=1 reverts)
 Upstream-commit: none (kbase backend only)
 Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: rg477m/001 (fixes it); applies on the full g615-v11-csf series after rg477m/020
-Validation test: Arkham Asylum launch + checkpoint restart, interleaved on one build: specks 0/9 valid runs vs 6/7 with PANVK_KBASE_PRIVATE_LOCAL=1 (10 rounds per arm, one-sided Fisher p<0.001); ASTC mips with missing blocks after copy 0/11006 vs 91-219 per launch; game context imports 2278 outer (c43e) + 19 exported inner (c23e); no GPU faults in 20 runs; PanProbe 38/38 x3
+Validation test: Arkham Asylum launch + checkpoint restart, interleaved on one build: specks 0/9 valid runs vs 6/7 with PANVK_KBASE_PRIVATE_LOCAL=1 (10 rounds per arm, one-sided Fisher p<0.001); ASTC mips with missing blocks after copy 0 of 11006 vs 310 of 11005 in one launch; game context imports 2278 outer (c43e) + 19 exported inner (c23e); no GPU faults in 20 runs; PanProbe 38/38 x3; frame rate at 1255 MHz unchanged (Arkham 25.35 vs 25.15 fps, Hades 227.7 vs 228.5); no shareability faults in 8 Hades runs
 Generated-by: LLM
 ---
  src/panfrost/lib/kmod/kbase_kmod.c        | 15 ++++++++++++++-
