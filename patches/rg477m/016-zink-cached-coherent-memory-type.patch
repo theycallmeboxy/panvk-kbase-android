@@ -1,0 +1,431 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:37:29 -0400
+Subject: [PATCH] panvk: offer Zink a cached memory type kept coherent by the
+ driver
+
+Without IO coherency (kbase on Mali-G615 here: the GPU doesn't snoop CPU
+caches for these mappings), PanVK's host-visible memory is either coherent
+and uncached, or cached and non-coherent. Zink only uses cached memory when
+it is also coherent, so its staging and readback buffers get the uncached
+type. GameNative's OpenGL path presents every frame by reading it back
+through such a buffer: a 1280x960 frame was copied out of uncached memory,
+15-20% of the game's main thread.
+
+Add a fourth memory type, HOST_CACHED | HOST_COHERENT, after the existing
+ones, whose coherency the driver maintains: allocations from it get a cached
+CPU mapping and join a per-device list; before every submission the CPU
+caches of all mapped ones are cleaned, and whenever GPU work is seen to
+complete (kbase sync waits, which timeline waits and counter queries also
+end in) they are cleaned and invalidated. Mapping starts from a clean and
+invalidated range; unmapping cleans first. The list lock is held while the
+cache ops run, so a mapping can't go away under them.
+
+The cleaning before each submission costs in proportion to how much memory
+is in the list. DXVK also picks this type, for many buffers, and Megabonk
+dropped from 60 to 42 fps with it, so it is only offered when the engine is
+Zink ("mesa zink"); PANVK_EMUL_COHERENT_CACHED=1/0 forces it on/off.
+
+Jupiter Hell (OpenGL through Zink), default clocks: main menu 50.7 -> 59.7
+fps (60 is the cap); in the first level no measurable change (13.4 vs 13.9
+fps; there the GPU clock and the game's pacing limit it, not the copy).
+Megabonk and Hades (DXVK) unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit 7a04dc5c1ddb431dfc7d3cb3b060ed3180d9f9f4)
+
+Purpose: give Zink a HOST_CACHED|HOST_COHERENT memory type whose coherency the driver keeps with CPU cache maintenance (clean before each submission, clean+invalidate when GPU work is seen complete), so its staging/readback buffers aren't uncached; GameNative's OpenGL path reads every frame back through one. Offered only to engine "mesa zink" (DXVK also picks it and loses fps to the per-submit cleaning)
+Upstream-commit: none (Mesa main has the same two host-visible types without IO coherency)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none of ours; applies on the full g615-v11-csf series
+Validation test: cohtest (CPU reads after GPU fill, GPU copy after CPU write, 4 KiB-4 MiB, completion via vkQueueWaitIdle / vkWaitSemaphores / vkGetSemaphoreCounterValue polling): 0 stale / 0 missing words on the new type (the plain cached type without maintenance: millions); Jupiter Hell main menu 50.7 -> 59.7 fps at default clocks, first level unchanged (13.4 vs 13.9); Megabonk 60 fps (42 when forced on for DXVK); Hades x64Vk at 1255 MHz 173.3 vs 172.4 fps; drawbench 8/8, racetest, msrtss identical
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c |  4 +
+ src/panfrost/vulkan/panvk_device.h           |  7 ++
+ src/panfrost/vulkan/panvk_device_memory.c    | 82 +++++++++++++++++++-
+ src/panfrost/vulkan/panvk_device_memory.h    | 16 ++++
+ src/panfrost/vulkan/panvk_physical_device.c  | 60 +++++++++++++-
+ src/panfrost/vulkan/panvk_physical_device.h  |  4 +
+ src/panfrost/vulkan/panvk_vX_device.c        |  4 +
+ 7 files changed, 171 insertions(+), 6 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index ee50114f..ffd6e6b3 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -1851,6 +1851,7 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
+ 
+    cs_builder_fini(&b);
+ 
++   panvk_emul_coherent_flush(dev);
+    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+ 
+ #ifdef HAVE_PAN_KMOD_KBASE
+@@ -3079,6 +3080,7 @@ panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
+ 
+    /* Flush pending synchronization requests before submitting the job, to
+     * make sure things are GPU-visible. */
++   panvk_emul_coherent_flush(dev);
+    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+ 
+    uint32_t touched = 0;
+@@ -3210,6 +3212,7 @@ panvk_queue_submit_ioctl(struct panvk_queue_submit *submit)
+ 
+    /* Flush pending synchronization requests before submitting the job, to
+     * make sure things are GPU-visible. */
++   panvk_emul_coherent_flush((struct panvk_device *)dev);
+    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+ 
+    struct drm_panthor_group_submit gsubmit = {
+@@ -3290,6 +3293,7 @@ panvk_queue_submit_process_debug(const struct panvk_queue_submit *submit,
+          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+       }
+ 
++      panvk_emul_coherent_flush(dev);
+       pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+ 
+       for (uint32_t i = 0; i < submit->qsubmit_count; i++) {
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index e23595cc..c08e2588 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -8,6 +8,7 @@
+ 
+ #include <stdint.h>
+ 
++#include "util/list.h"
+ #include "vk_debug_utils.h"
+ #include "vk_device.h"
+ #include "vk_meta.h"
+@@ -56,6 +57,12 @@ enum panvk_queue_family {
+ struct panvk_device {
+    struct vk_device vk;
+ 
++   /* Live memory of the emulated coherent cached type (panvk_device_memory). */
++   struct {
++      simple_mtx_t lock;
++      struct list_head list;
++   } emul_cc;
++
+    struct {
+       simple_mtx_t lock;
+       struct util_vma_heap heap;
+diff --git a/src/panfrost/vulkan/panvk_device_memory.c b/src/panfrost/vulkan/panvk_device_memory.c
+index 92130a09..37d7d6e5 100644
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -233,6 +233,15 @@ panvk_AllocateMemory(VkDevice _device,
+ 
+    panvk_memory_emit_report(device, mem, pAllocateInfo, VK_SUCCESS);
+ 
++   if ((int)pAllocateInfo->memoryTypeIndex ==
++          physical_device->memory.emul_coherent_cached_idx &&
++       (mem->bo->flags & PAN_KMOD_BO_FLAG_WB_MMAP)) {
++      mem->emul_cc = true;
++      simple_mtx_lock(&device->emul_cc.lock);
++      list_addtail(&mem->emul_cc_link, &device->emul_cc.list);
++      simple_mtx_unlock(&device->emul_cc.lock);
++   }
++
+    p_atomic_add(&physical_device->memory.heap_used,
+                 (uint64_t)pan_kmod_bo_size(mem->bo));
+ 
+@@ -268,6 +277,12 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
+    struct panvk_physical_device *physical_device =
+       to_panvk_physical_device(device->vk.physical);
+ 
++   if (mem->emul_cc) {
++      simple_mtx_lock(&device->emul_cc.lock);
++      list_del(&mem->emul_cc_link);
++      simple_mtx_unlock(&device->emul_cc.lock);
++   }
++
+    p_atomic_add(&physical_device->memory.heap_used,
+                 -((int64_t)pan_kmod_bo_size(mem->bo)));
+ 
+@@ -389,7 +404,17 @@ panvk_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
+                           "Memory object couldn't be mapped.");
+ 
+    assert(!host_addr || addr == host_addr);
+-   mem->addr.host = addr;
++   if (mem->emul_cc) {
++      /* Start the mapping without stale lines from an earlier one. */
++      simple_mtx_lock(&device->emul_cc.lock);
++      mem->addr.host = addr;
++      pan_kmod_queue_bo_map_sync(mem->bo, 0, addr, pan_kmod_bo_size(mem->bo),
++                                 PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE);
++      pan_kmod_flush_bo_map_syncs(device->kmod.dev);
++      simple_mtx_unlock(&device->emul_cc.lock);
++   } else {
++      mem->addr.host = addr;
++   }
+    mem->map_count = 1;
+    *ppData = (char *)addr + offset;
+ 
+@@ -409,13 +434,26 @@ panvk_UnmapMemory2KHR(VkDevice _device,
+    }
+    mem->map_count = 0;
+ 
++   /* Writes through the cached mapping must reach memory before it goes
++    * away; keep the flush/invalidate walkers off it while it does. */
++   if (mem->emul_cc) {
++      simple_mtx_lock(&device->emul_cc.lock);
++      pan_kmod_queue_bo_map_sync(mem->bo, 0, mem->addr.host,
++                                 pan_kmod_bo_size(mem->bo),
++                                 PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH);
++      pan_kmod_flush_bo_map_syncs(device->kmod.dev);
++   }
++
+    if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
+       void *reserved =
+          os_mmap(mem->addr.host, pan_kmod_bo_size(mem->bo), PROT_NONE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+-      if (reserved == MAP_FAILED)
++      if (reserved == MAP_FAILED) {
++         if (mem->emul_cc)
++            simple_mtx_unlock(&device->emul_cc.lock);
+          return panvk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
+                              "Failed to reserve VA on unmap.");
++      }
+    } else {
+       ASSERTED int ret = pan_kmod_bo_munmap(mem->bo, mem->addr.host,
+                                             pan_kmod_bo_size(mem->bo));
+@@ -424,6 +462,9 @@ panvk_UnmapMemory2KHR(VkDevice _device,
+ 
+    mem->addr.host = NULL;
+ 
++   if (mem->emul_cc)
++      simple_mtx_unlock(&device->emul_cc.lock);
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -593,3 +634,40 @@ panvk_SetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory memory,
+                                  float priority)
+ {
+ }
++
++static void
++emul_coherent_sync(struct panvk_device *dev, enum pan_kmod_bo_sync_type type)
++{
++   simple_mtx_lock(&dev->emul_cc.lock);
++
++   bool queued = false;
++   list_for_each_entry(struct panvk_device_memory, mem, &dev->emul_cc.list,
++                       emul_cc_link) {
++      if (!mem->addr.host)
++         continue;
++
++      pan_kmod_queue_bo_map_sync(mem->bo, 0, mem->addr.host,
++                                 pan_kmod_bo_size(mem->bo), type);
++      queued = true;
++   }
++
++   /* Run the ops while the mappings can't go away. */
++   if (queued)
++      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
++
++   simple_mtx_unlock(&dev->emul_cc.lock);
++}
++
++void
++panvk_emul_coherent_flush(struct panvk_device *dev)
++{
++   emul_coherent_sync(dev, PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH);
++}
++
++void
++panvk_emul_coherent_invalidate(struct panvk_device *dev)
++{
++   /* Clean as well as invalidate: CPU writes made since the last submission
++    * must not be dropped. */
++   emul_coherent_sync(dev, PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE);
++}
+diff --git a/src/panfrost/vulkan/panvk_device_memory.h b/src/panfrost/vulkan/panvk_device_memory.h
+index 196927eb..d8ad401d 100644
+--- a/src/panfrost/vulkan/panvk_device_memory.h
++++ b/src/panfrost/vulkan/panvk_device_memory.h
+@@ -8,6 +8,7 @@
+ 
+ #include <stdint.h>
+ 
++#include "util/list.h"
+ #include "vk_device_memory.h"
+ 
+ struct panvk_priv_bo;
+@@ -24,6 +25,12 @@ struct panvk_device_memory {
+     * panvk_MapMemory2KHR). */
+    uint32_t map_count;
+ 
++   /* Allocated from the emulated coherent cached type with a cached CPU
++    * mapping: on panvk_device::emul_cc.list, kept coherent by
++    * panvk_emul_coherent_flush() / panvk_emul_coherent_invalidate(). */
++   bool emul_cc;
++   struct list_head emul_cc_link;
++
+    struct {
+       /* Don't use this pointer, it's only to have user memory dumped when
+        * PANVK_DEBUG=dump. */
+@@ -34,4 +41,13 @@ struct panvk_device_memory {
+ VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_device_memory, vk.base, VkDeviceMemory,
+                                VK_OBJECT_TYPE_DEVICE_MEMORY)
+ 
++struct panvk_device;
++
++/* Clean the CPU caches of all mapped emulated-coherent memory, before GPU
++ * work is submitted. */
++void panvk_emul_coherent_flush(struct panvk_device *dev);
++
++/* Clean and invalidate them, after GPU work has been seen to complete. */
++void panvk_emul_coherent_invalidate(struct panvk_device *dev);
++
+ #endif
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index d9b7cbcd..81ad70bc 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -27,6 +27,7 @@
+ #include "util/os_misc.h"
+ #include "util/os_time.h"
+ #include "util/u_atomic.h"
++#include "util/u_debug.h"
+ #include "git_sha1.h"
+ 
+ #include "vk_android.h"
+@@ -39,6 +40,7 @@
+ #include "vk_util.h"
+ 
+ #include "panvk_device.h"
++#include "panvk_device_memory.h"
+ #include "panvk_entrypoints.h"
+ #include "panvk_image.h"
+ #include "panvk_instance.h"
+@@ -587,6 +589,37 @@ get_device_heaps(struct panvk_physical_device *device,
+       };
+    }
+ 
++   /* Without IO coherency, also offer a cached type that is reported coherent
++    * and kept coherent by the driver: CPU caches are cleaned before every
++    * submission and cleaned+invalidated whenever GPU work is seen complete.
++    * Users of coherent-only host memory (Zink's staging and readback
++    * buffers) would otherwise get uncached memory, and reading a frame back
++    * from it is several times slower. It comes last, so anything asking for
++    * plain coherent memory still gets the uncached type.
++    *
++    * Only Zink gets it by default: DXVK also picks it, for many buffers, and
++    * then pays for cleaning all of them before every submission (Megabonk
++    * 60 -> 42 fps). PANVK_EMUL_COHERENT_CACHED=1/0 forces it on/off. */
++   const char *engine = instance->vk.app_info.engine_name;
++   const bool emul_cc_default = engine && !strcmp(engine, "mesa zink");
++   device->memory.emul_coherent_cached_idx = -1;
++   if (!device->kmod.dev->props.is_io_coherent &&
++       host_cached_not_coherent_idx != -1 &&
++       debug_get_bool_option("PANVK_EMUL_COHERENT_CACHED", emul_cc_default)) {
++      assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
++      device->memory.emul_coherent_cached_idx = device->memory.type_count;
++      device->memory.types[device->memory.type_count++] = (VkMemoryType) {
++         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
++                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
++         .heapIndex = 0,
++      };
++      mesa_logi("panvk: memory type %d is cached and kept coherent by the "
++                "driver (engine \"%s\")",
++                device->memory.emul_coherent_cached_idx, engine ? engine : "");
++   }
++
+    /* Ideally, we'd place HOST_CACHED first for perf reasons, but there's
+     * so many broken CTS tests (missing or invalid flush/invalidate
+     * calls), and so many added at each version that it gets impossible to
+@@ -909,10 +942,11 @@ kbase_cpu_sync_wait_one(struct vk_device *device, struct kbase_cpu_sync *ks,
+ }
+ 
+ static VkResult
+-kbase_cpu_sync_wait_many(struct vk_device *device,
+-                         uint32_t wait_count, const struct vk_sync_wait *waits,
+-                         enum vk_sync_wait_flags wait_flags,
+-                         uint64_t abs_timeout_ns)
++kbase_cpu_sync_wait_many_impl(struct vk_device *device,
++                              uint32_t wait_count,
++                              const struct vk_sync_wait *waits,
++                              enum vk_sync_wait_flags wait_flags,
++                              uint64_t abs_timeout_ns)
+ {
+    bool wait_any = !!(wait_flags & VK_SYNC_WAIT_ANY);
+ 
+@@ -944,6 +978,24 @@ kbase_cpu_sync_wait_many(struct vk_device *device,
+    }
+ }
+ 
++static VkResult
++kbase_cpu_sync_wait_many(struct vk_device *device,
++                         uint32_t wait_count, const struct vk_sync_wait *waits,
++                         enum vk_sync_wait_flags wait_flags,
++                         uint64_t abs_timeout_ns)
++{
++   VkResult result = kbase_cpu_sync_wait_many_impl(device, wait_count, waits,
++                                                   wait_flags, abs_timeout_ns);
++
++   /* GPU work was seen complete (timeline waits and counter queries end
++    * here too): make its writes visible through cached "coherent" mappings
++    * before the caller reads them. */
++   if (result == VK_SUCCESS && !(wait_flags & VK_SYNC_WAIT_PENDING))
++      panvk_emul_coherent_invalidate(to_panvk_device(device));
++
++   return result;
++}
++
+ static VkResult
+ kbase_cpu_sync_move(UNUSED struct vk_device *device, struct vk_sync *dst,
+                     struct vk_sync *src)
+diff --git a/src/panfrost/vulkan/panvk_physical_device.h b/src/panfrost/vulkan/panvk_physical_device.h
+index 2edfbd9e..c0940125 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.h
++++ b/src/panfrost/vulkan/panvk_physical_device.h
+@@ -70,6 +70,10 @@ struct panvk_physical_device {
+       VkMemoryType types[4];
+       uint32_t type_count;
+ 
++      /* Index of the HOST_CACHED|HOST_COHERENT type whose coherency the driver
++       * keeps by CPU cache maintenance (see panvk_device_memory.c), or -1. */
++      int emul_coherent_cached_idx;
++
+       uint64_t max_supported_va;
+       alignas(8) uint64_t heap_used;
+       alignas(8) uint64_t available;
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index e25566eb..9867372c 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -652,6 +652,8 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+ #endif
+ 
+    simple_mtx_init(&device->as.lock, mtx_plain);
++   simple_mtx_init(&device->emul_cc.lock, mtx_plain);
++   list_inithead(&device->emul_cc.list);
+ 
+    /* capture/replay requires a separate AS for fixed allocations. */
+    if (device->vk.enabled_features.bufferDeviceAddressCaptureReplay) {
+@@ -906,6 +908,7 @@ err_free_heaps:
+    if (device->as.split_heap)
+       util_vma_heap_finish(&device->as.fixed_heap);
+    simple_mtx_destroy(&device->as.lock);
++   simple_mtx_destroy(&device->emul_cc.lock);
+ 
+ err_destroy_kdev:
+    if (device->debug.decode_ctx)
+@@ -969,6 +972,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
+    if (device->as.split_heap)
+       util_vma_heap_finish(&device->as.fixed_heap);
+    simple_mtx_destroy(&device->as.lock);
++   simple_mtx_destroy(&device->emul_cc.lock);
+ 
+    if (device->debug.decode_ctx)
+       pandecode_destroy_context(device->debug.decode_ctx);
+-- 
+2.55.0
+

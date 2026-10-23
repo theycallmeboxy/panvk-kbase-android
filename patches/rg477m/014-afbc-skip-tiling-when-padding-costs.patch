@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 16:29:52 -0400
+Subject: [PATCH] pan/mod: don't pick tiled AFBC when tile padding costs more
+ than 1/8
+
+With AFBC_FORMAT_MOD_TILED each mip level is padded to whole tiles of 8x8
+superblocks (128x128 pixels for 32-bit formats), and sparse AFBC reserves
+the uncompressed payload, so every level smaller than a tile costs a full
+tile (~64 KiB for RGBA8). The only size check was on the base level, so
+mipmapped textures of 64-512 pixels were mostly padding: 64x64 RGBA8 with
+mips took 476 KiB instead of 28 KiB, 256x256 804 KiB instead of 352 KiB,
+for every such texture a game loads.
+
+Sum the padded area over all levels for tiled and plain superblocks, and
+report tiled AFBC as not optimal when it would cost more than 1/8 extra;
+the image then gets plain (non-tiled) AFBC. Large images keep tiled AFBC.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit fd04fb75a723855a50c64dfaf5116f18191e12b0)
+
+Purpose: stop tiled AFBC from padding every small mip level to a whole 128x128-pixel tile (sparse AFBC reserves the uncompressed size, ~64 KiB per level for RGBA8); mipmapped textures of 64-512 px fall back to plain AFBC and shrink up to 17x
+Upstream-commit: none (Mesa main has the same base-level-only check; upstream candidate)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: csf-v11/151
+Validation test: vkGetImageMemoryRequirements with mips: RGBA8 64x64 487424 -> 28672 B, 128x128 557056 -> 94208, 256x256 823296 -> 360448, 512x512 1888256 -> 1425408, D24S8 64x64 516096 -> 28672; 1024+ unchanged (still tiled). Hades x64Vk at 1255 MHz uncapped A-B-B-A: 176.5/172.4 -> 176.4/174.9 fps; Megabonk GPU memory 1400 -> 1325 MB, Valheim and Moonlighter unchanged (DXVK suballocates); racetest all cases 0/100 stale, controls 100/100; drawbench image checksums identical (8 tests)
+Generated-by: LLM
+---
+ src/panfrost/lib/pan_mod.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/panfrost/lib/pan_mod.c b/src/panfrost/lib/pan_mod.c
+index ff9eca6c..1e497387 100644
+--- a/src/panfrost/lib/pan_mod.c
++++ b/src/panfrost/lib/pan_mod.c
+@@ -237,6 +237,29 @@ pan_mod_afbc_test_props(const struct pan_kmod_dev_props *dprops,
+       if (iprops->extent_px.width < tile_extent_px.width / 2 ||
+           iprops->extent_px.height < tile_extent_px.height / 2)
+          return PAN_MOD_NOT_OPTIMAL;
++
++      /* Each mip level is padded to whole tiles (8x8 superblocks, 128x128
++       * pixels for 32-bit formats), and sparse AFBC reserves the uncompressed
++       * size, so every level smaller than a tile costs a full one (~64 KiB
++       * for RGBA8): a 64x64 texture with mips took 476 KiB instead of 28 KiB.
++       * Skip tiling when it would cost more than 1/8 over plain superblocks.
++       */
++      uint64_t tiled_px = 0, plain_px = 0;
++      for (unsigned l = 0; l < iprops->nr_slices; l++) {
++         unsigned w = u_minify(iprops->extent_px.width, l);
++         unsigned h = u_minify(iprops->extent_px.height, l);
++
++         tiled_px += (uint64_t)DIV_ROUND_UP(w, tile_extent_px.width) *
++                     tile_extent_px.width *
++                     DIV_ROUND_UP(h, tile_extent_px.height) *
++                     tile_extent_px.height;
++         plain_px += (uint64_t)DIV_ROUND_UP(w, superblock_extent_px.width) *
++                     superblock_extent_px.width *
++                     DIV_ROUND_UP(h, superblock_extent_px.height) *
++                     superblock_extent_px.height;
++      }
++      if (tiled_px > plain_px + plain_px / 8)
++         return PAN_MOD_NOT_OPTIMAL;
+    } else {
+       /* For images thinner than a superblock, fall through to U-interleaved. */
+       if (iprops->extent_px.width < superblock_extent_px.width ||
+-- 
+2.55.0
+

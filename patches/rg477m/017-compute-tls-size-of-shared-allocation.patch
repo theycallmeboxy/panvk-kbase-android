@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikhail Mlhcnn <mikhail@advnirr.org>
+Date: Sun, 27 Sep 2026 13:58:30 +0300
+Subject: [PATCH] panvk/csf: give compute jobs the TLS size of the shared
+ allocation
+
+Command buffers use a shared TLS allocation sized for the largest stack
+requirement. Compute and precomp dispatches copy the base pointer into
+their private TSD, but previously left the TLS size field set to the
+job's own shader stack size.
+
+With packed TLS addressing, thread stack stride depends on this size field.
+When jobs with different stack sizes execute concurrently without barriers,
+the job with smaller stride overwrites the stack of the other job, causing
+memory corruption or out-of-bounds GPU page faults.
+
+Fix this by copying word 0 (TLS size) of the shared descriptor along with
+the base pointer.
+
+Fixes GPU page faults in 3DMark Wild Life Extreme on Mali-G615.
+
+Fixes: 5544d39f442 ("panvk: Add a CSF backend for panvk_queue/cmd_buffer")
+Fixes: cc02c5deb42 ("panvk: Implement precomp dispatch")
+Assisted-by: Claude Code (Claude Opus 5.5)
+Reviewed-by: Lars-Ivar Hesselberg Simonsen <lars-ivar.simonsen@arm.com>
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Reviewed-by: Erik Faye-Lund <erik.faye-lund@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44753>
+(cherry picked from commit 09ad390c8d06b73289228a43de572b5c5797c4a7)
+
+Purpose: backport of Mesa main 81db71cf: compute and precomp jobs copy the shared TLS base pointer but kept their own (smaller) stack size, so with packed TLS addressing concurrently running jobs with different stack sizes overwrite each other's stacks (GPU page faults, e.g. 3DMark Wild Life Extreme on Mali-G615)
+Upstream-commit: 81db71cf (Mesa main, MR 44753); drop when the pinned Mesa base includes it
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none of ours
+Validation test: PanProbe 38/38; drawbench 8/8, racetest and msrtss identical to rg477m/016; Megabonk, Moonlighter, Valheim boot as before
+Generated-by: upstream (backport, applied unchanged with git am)
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c | 4 +++-
+ src/panfrost/vulkan/csf/panvk_vX_cmd_precomp.c  | 4 +++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c
+index 3586e17b..5985d99a 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c
+@@ -410,11 +410,13 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+ 
+    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+ 
+-   /* Copy the global TLS pointer to the per-job TSD. */
++   /* Copy the global TLS pointer and size to the per-job TSD. */
+    if (cs->info.tls_size) {
+       cs_move64_to(b, cs_scratch_reg64(b, 0), cmdbuf->state.tls.desc.gpu);
++      cs_load32_to(b, cs_scratch_reg32(b, 4), cs_scratch_reg64(b, 0), 0);
+       cs_load64_to(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
+       cs_move64_to(b, cs_scratch_reg64(b, 0), tsd);
++      cs_store32(b, cs_scratch_reg32(b, 4), cs_scratch_reg64(b, 0), 0);
+       cs_store64(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
+       cs_flush_stores(b);
+    }
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_precomp.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_precomp.c
+index a3be5176..5dabf3fe 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_precomp.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_precomp.c
+@@ -64,11 +64,13 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
+    const struct cs_tracing_ctx *tracing_ctx =
+       &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE].tracing;
+ 
+-   /* Copy the global TLS pointer to the per-job TSD. */
++   /* Copy the global TLS pointer and size to the per-job TSD. */
+    if (shader->info.tls_size) {
+       cs_move64_to(b, cs_scratch_reg64(b, 0), cmdbuf->state.tls.desc.gpu);
++      cs_load32_to(b, cs_scratch_reg32(b, 4), cs_scratch_reg64(b, 0), 0);
+       cs_load64_to(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
+       cs_move64_to(b, cs_scratch_reg64(b, 0), tsd);
++      cs_store32(b, cs_scratch_reg32(b, 4), cs_scratch_reg64(b, 0), 0);
+       cs_store64(b, cs_scratch_reg64(b, 2), cs_scratch_reg64(b, 0), 8);
+       cs_flush_stores(b);
+    }
+-- 
+2.55.0
+

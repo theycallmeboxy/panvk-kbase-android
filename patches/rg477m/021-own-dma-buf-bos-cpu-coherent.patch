@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 23:22:11 -0400
+Subject: [PATCH] panfrost/kbase: keep the driver's own never-exported dma-buf
+ BOs CPU-coherent
+
+With a dma-heap available, kbase_kmod_bo_alloc() backs every BO without an
+exclusive VM with a dma-heap buffer that it imports through
+kbase_kmod_import_dmabuf(). Besides exportable memory, that covers
+host-visible memory when memoryMapPlaced is enabled, which Wine's Vulkan
+layer does for 32-bit (WoW64) processes; DXVK's staging buffers in 32-bit
+games land there. "import dma-bufs inner-shareable"
+made all of these imports COHERENT_LOCAL, so the GPU stopped snooping the
+CPU's cached dma-buf mapping: CPU writes still in the cache reach GPU copies
+as zeros. In Batman: Arkham Asylum, whose DXT textures GameNative transcodes
+to ASTC 8x8 on the CPU, the zero blocks decode to the ASTC error colour and
+show as magenta specks on characters and loading-screen glyphs.
+
+Add PAN_KMOD_BO_FLAG_NO_EXPORT, which PanVK sets on BOs that are shareable
+only for placed maps, and import those COHERENT_SYSTEM again. Nobody else
+maps them, so the shareability conflict the inner-shareable import avoids
+can't happen; external imports and exportable memory stay COHERENT_LOCAL.
+PANVK_KBASE_PRIVATE_LOCAL=1 keeps the old behaviour.
+
+Arkham Asylum, launch + checkpoint restart, interleaved, same build:
+specks in 0/9 valid runs (fix) vs 6/7 (PANVK_KBASE_PRIVATE_LOCAL=1), 10
+rounds each; with a CPU wait after each submit, uploaded ASTC mips with
+missing blocks 0 of 11006 vs 310 of 11005 in one launch. No GPU faults;
+PanProbe 38/38 x3. Frame rate at 1255 MHz unchanged: Arkham 25.35 vs
+25.15 fps; 64-bit Hades (no placed maps, untouched) 227.7 vs 228.5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit 4e2fecee8c7a5f22ad5d8a964fc9c2aaa63cdd6c)
+
+Purpose: fix magenta specks / zero blocks in uploaded textures (Arkham Asylum) caused by rg477m/001: the driver's own never-exported dma-heap BOs (placed-map host memory, DXVK staging in 32-bit/WoW64 games) were imported inner-shareable, so the GPU did not snoop the CPU's cached writes; import those COHERENT_SYSTEM again (PANVK_KBASE_PRIVATE_LOCAL=1 reverts)
+Upstream-commit: none (kbase backend only)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/001 (fixes it); applies on the full g615-v11-csf series after rg477m/019
+Validation test: Arkham Asylum launch + checkpoint restart, interleaved on one build: specks 0/9 valid runs vs 6/7 with PANVK_KBASE_PRIVATE_LOCAL=1 (10 rounds per arm, one-sided Fisher p<0.001); ASTC mips with missing blocks after copy 0 of 11006 vs 310 of 11005 in one launch; game context imports 2278 outer (c43e) + 19 exported inner (c23e); no GPU faults in 20 runs; PanProbe 38/38 x3; frame rate at 1255 MHz unchanged (Arkham 25.35 vs 25.15 fps, Hades 227.7 vs 228.5); no shareability faults in 8 Hades runs
+Generated-by: LLM
+---
+ src/panfrost/lib/kmod/kbase_kmod.c        | 15 ++++++++++++++-
+ src/panfrost/lib/kmod/pan_kmod.h          |  6 ++++++
+ src/panfrost/vulkan/panvk_device_memory.c |  6 ++++++
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 1741dc0e..33e910b3 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -531,7 +531,8 @@ kbase_dev_query_props(struct kbase_kmod_dev *kbase_dev,
+                                 PAN_KMOD_BO_FLAG_NO_MMAP |
+                                 PAN_KMOD_BO_FLAG_WB_MMAP |
+                                 PAN_KMOD_BO_FLAG_GPU_UNCACHED |
+-                                PAN_KMOD_BO_FLAG_CSF_EVENT;
++                                PAN_KMOD_BO_FLAG_CSF_EVENT |
++                                PAN_KMOD_BO_FLAG_NO_EXPORT;
+ }
+ 
+ /* -------------------------------------------------------------------------
+@@ -2025,6 +2026,18 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
+       BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+       BASE_MEM_IMPORT_SHARED | BASE_MEM_COHERENT_LOCAL;
+ 
++   /* Our own dma-heap buffers that are never exported (the dma-buf only backs
++    * placed CPU maps) are written by the CPU through a cached mapping and read
++    * by no other driver. Map them outer-shareable so the GPU snoops the CPU
++    * caches (ACE-Lite); inner-shareable, the GPU can read memory the CPU's
++    * writes haven't reached yet (Arkham Asylum: staging lines read as zeros,
++    * which ASTC decodes to magenta). PANVK_KBASE_PRIVATE_LOCAL=1 keeps them
++    * inner-shareable. */
++   if (!external_import && (kmod_flags & PAN_KMOD_BO_FLAG_NO_EXPORT) &&
++       !debug_get_bool_option("PANVK_KBASE_PRIVATE_LOCAL", false))
++      import_flags = (import_flags & ~BASE_MEM_COHERENT_LOCAL) |
++                     BASE_MEM_COHERENT_SYSTEM;
++
+    if (kmod_flags & PAN_KMOD_BO_FLAG_GPU_UNCACHED)
+       import_flags |= BASE_MEM_UNCACHED_GPU;
+    if (kmod_flags & PAN_KMOD_BO_FLAG_WB_MMAP)
+diff --git a/src/panfrost/lib/kmod/pan_kmod.h b/src/panfrost/lib/kmod/pan_kmod.h
+index 410c410d..1d71715b 100644
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -137,6 +137,12 @@ enum pan_kmod_bo_flags {
+ 
+    /* kbase CSF event memory monitored for cross-CSG synchronization. */
+    PAN_KMOD_BO_FLAG_CSF_EVENT = BITFIELD_BIT(8),
++
++   /* The buffer object is never exported to another process or driver. Some
++    * backends still give it a shareable backing (kbase backs placed CPU maps
++    * with a dma-buf); this tells them nobody else will map it.
++    */
++   PAN_KMOD_BO_FLAG_NO_EXPORT = BITFIELD_BIT(9),
+ };
+ 
+ /* Allowed group priority flags. */
+diff --git a/src/panfrost/vulkan/panvk_device_memory.c b/src/panfrost/vulkan/panvk_device_memory.c
+index 37d7d6e5..cb5dd114 100644
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -132,6 +132,12 @@ panvk_AllocateMemory(VkDevice _device,
+          (device->vk.enabled_features.memoryMapPlaced &&
+           (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
+ 
++      /* Shareable only for placed maps: nobody else will map it. */
++      if (shareable && !can_be_exported &&
++          (device->kmod.dev->props.supported_bo_flags &
++           PAN_KMOD_BO_FLAG_NO_EXPORT))
++         bo_flags |= PAN_KMOD_BO_FLAG_NO_EXPORT;
++
+       bo_flags = panvk_device_adjust_bo_flags(device, bo_flags);
+       mem->bo = pan_kmod_bo_alloc(device->kmod.dev,
+                                   shareable ? NULL : device->kmod.vm,
+-- 
+2.55.0
+

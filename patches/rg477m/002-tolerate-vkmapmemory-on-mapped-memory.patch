@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 21:01:18 -0400
+Subject: [PATCH] panvk: tolerate vkMapMemory on already-mapped memory
+
+Mapping memory that is already host-mapped is invalid usage, but the Mali
+DDK returns the existing mapping and some layers rely on it: GameNative's
+Vulkan wrapper re-maps DXVK's persistently mapped staging memory to read
+BCn data for CPU transcoding. PanVK returned VK_ERROR_MEMORY_MAP_FAILED,
+the wrapper got no data and those textures stayed zero (invisible sprites
+in Hades). Return the existing mapping (PanVK maps the whole BO) and count
+maps; unmap on the last vkUnmapMemory. Placed maps still fail.
+
+Tested: map_test matches the DDK; Hades renders fully; PanProbe 38/38.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit 16ca3401eab41c8ec43d0772243502681dfbda07)
+
+Purpose: match the Mali DDK when already-mapped memory is mapped again (GameNative wrapper BCn path)
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: csf-v11/091
+Validation test: map_test (double map returns VK_SUCCESS + same pointer, like the DDK); Hades (DXVK) renders fully in GameNative; PanProbe 38/38
+Generated-by: LLM
+---
+ src/panfrost/vulkan/panvk_device_memory.c | 26 ++++++++++++++++++++---
+ src/panfrost/vulkan/panvk_device_memory.h |  4 ++++
+ 2 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_device_memory.c b/src/panfrost/vulkan/panvk_device_memory.c
+index cf9f4c0a..92130a09 100644
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -352,10 +352,23 @@ panvk_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
+    /* From the Vulkan 1.2.194 spec:
+     *
+     *    "memory must not be currently host mapped"
++    *
++    * Translation layers break this rule: GameNative's Vulkan wrapper maps
++    * memory that DXVK already keeps persistently mapped, to read texture data
++    * it converts from BCn to ASTC. The Mali blob (and other vendor drivers)
++    * return the existing mapping in that case; failing it here makes the
++    * wrapper upload all-zero textures. The whole BO is always mapped, so hand
++    * back the existing mapping and count it, and only unmap on the last
++    * vkUnmapMemory.
+     */
+-   if (mem->addr.host)
+-      return panvk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
+-                          "Memory object already mapped.");
++   if (mem->addr.host) {
++      if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT)
++         return panvk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
++                             "Memory object already mapped.");
++      mem->map_count++;
++      *ppData = (char *)mem->addr.host + offset;
++      return VK_SUCCESS;
++   }
+ 
+    void *host_addr = NULL;
+    int map_flags = MAP_SHARED;
+@@ -377,6 +390,7 @@ panvk_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
+ 
+    assert(!host_addr || addr == host_addr);
+    mem->addr.host = addr;
++   mem->map_count = 1;
+    *ppData = (char *)addr + offset;
+ 
+    return VK_SUCCESS;
+@@ -389,6 +403,12 @@ panvk_UnmapMemory2KHR(VkDevice _device,
+    VK_FROM_HANDLE(panvk_device, device, _device);
+    VK_FROM_HANDLE(panvk_device_memory, mem, pMemoryUnmapInfo->memory);
+ 
++   if (mem->map_count > 1) {
++      mem->map_count--;
++      return VK_SUCCESS;
++   }
++   mem->map_count = 0;
++
+    if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
+       void *reserved =
+          os_mmap(mem->addr.host, pan_kmod_bo_size(mem->bo), PROT_NONE,
+diff --git a/src/panfrost/vulkan/panvk_device_memory.h b/src/panfrost/vulkan/panvk_device_memory.h
+index 6fc545b6..196927eb 100644
+--- a/src/panfrost/vulkan/panvk_device_memory.h
++++ b/src/panfrost/vulkan/panvk_device_memory.h
+@@ -20,6 +20,10 @@ struct panvk_device_memory {
+       void *host;
+    } addr;
+ 
++   /* Number of outstanding vkMapMemory calls on this object (see
++    * panvk_MapMemory2KHR). */
++   uint32_t map_count;
++
+    struct {
+       /* Don't use this pointer, it's only to have user memory dumped when
+        * PANVK_DEBUG=dump. */
+-- 
+2.55.0
+

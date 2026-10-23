@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:41:51 -0400
+Subject: [PATCH] panvk/csf: defer the vertex/tiler wait on fragment work until
+ it matters
+
+Barriers whose second scope names pre-rasterization shader stages (common:
+renderers pass all shader stages after rendering to a texture) make the
+vertex/tiler subqueue wait for all prior fragment work, so the next
+render pass can't start tiling until the previous one is shaded.
+
+When the vertex/tiler side of the second scope is only pre-rasterization
+shader stages, record the wait instead of emitting it. Emit it before the
+first draw whose vertex-stage shaders access memory (textures, images,
+SSBOs, global; flagged at compile time and kept in the shader cache) or
+that uses geometry/tessellation, before any barrier where another subqueue
+waits on the vertex/tiler one, before events and queries, before executing
+secondaries and at the end of the command buffer. The fragment subqueue
+still signals. PANVK_NO_LAZY_VT_WAIT=1 disables it.
+
+Hades (Vulkan renderer), Mali-G615 MC6: 502 MHz 48.3 -> 54.7 fps (DDK
+58.4), 1255 MHz 103.1 -> 123.9 fps (DDK 132.2). Hades through DXVK
+unchanged (99.9 / 100.9 fps at 502 MHz). PanProbe 38/38.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit e574c713cf29f750d22e62f3b7eca2c40af3bd7b)
+
+Purpose: defer the vertex/tiler wait on fragment work for barriers that only name pre-rasterization shader stages, until a draw whose vertex-stage shaders access memory
+Upstream-commit: none (generic PanVK CSF; upstream candidate)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none
+Validation test: Hades Vulkan renderer 48.3 -> 54.7 fps at 502 MHz (DDK 58.4), 103.1 -> 123.9 at 1255 MHz (DDK 132.2); Hades DXVK unchanged; PanProbe 38/38; no GPU faults
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h    | 14 ++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 80 +++++++++++++++++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   |  8 ++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_event.c  |  6 ++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_query.c  | 10 +++
+ src/panfrost/vulkan/panvk_shader.h            |  2 +
+ src/panfrost/vulkan/panvk_vX_shader.c         | 33 ++++++++
+ 7 files changed, 153 insertions(+)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index c1c24d60..5f245ac6 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -289,6 +289,11 @@ struct panvk_cs_deps {
+    } dst[PANVK_SUBQUEUE_COUNT];
+ 
+    struct panvk_cs_crc_deps crc;
++
++   /* The vertex/tiler subqueue must wait for the fragment subqueue right away
++    * (it may read the data in a stage other than a pre-rasterization shader).
++    */
++   bool vt_frag_wait_now;
+ };
+ 
+ enum panvk_sb_ids {
+@@ -466,6 +471,13 @@ struct panvk_cs_state {
+     * Needs to be offset with the subqueue sync point. */
+    int32_t relative_sync_point;
+ 
++   /* Vertex/tiler only: a wait on the fragment subqueue that a barrier asked
++    * for but that was deferred until vertex-stage work that may access
++    * memory (see panvk_per_arch(cmd_flush_lazy_vt_wait)).
++    */
++   bool lazy_frag_wait;
++   int32_t lazy_frag_sync_point;
++
+    struct cs_tracing_ctx tracing;
+ };
+ 
+@@ -937,6 +949,8 @@ void panvk_per_arch(add_cs_deps)(
+    struct panvk_cs_deps *out,
+    bool is_set_event);
+ 
++void panvk_per_arch(cmd_flush_lazy_vt_wait)(struct panvk_cmd_buffer *cmdbuf);
++
+ VkResult panvk_per_arch(cmd_prepare_exec_cmd_for_draws)(
+    struct panvk_cmd_buffer *primary, struct panvk_cmd_buffer *secondary,
+    uint32_t samples);
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index 7ec296c2..30c8d52f 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -327,6 +327,8 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
++
+    /* Finishing queries requires a barrier. We don't want to do that more
+     * often than necessary. At the end of a primary is usually enough.
+     * Additionally, simultaneous use secondaries also need to flush if they
+@@ -543,6 +545,26 @@ collect_cs_deps(struct panvk_cmd_buffer *cmdbuf, const VkDependencyInfo *info,
+          ~BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER);
+    }
+ 
++   /* A vertex/tiler wait on fragment work can be deferred when the
++    * vertex/tiler side of the second scope is only pre-rasterization shader
++    * stages: it then only matters for draws whose shaders access memory. */
++   if (wait_masks[PANVK_SUBQUEUE_VERTEX_TILER] &
++       BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT)) {
++      const VkPipelineStageFlags2 lazy_ok =
++         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
++         VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
++         VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
++         VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
++         VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT |
++         VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
++      const VkPipelineStageFlags2 vt_dst =
++         dst.stages & panvk_get_subqueue_stages(PANVK_SUBQUEUE_VERTEX_TILER);
++
++      if ((vt_dst & ~lazy_ok) || cmdbuf->state.gfx.render.tiler ||
++          inherits_render_ctx(cmdbuf))
++         deps->vt_frag_wait_now = true;
++   }
++
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+       if (wait_masks[i] & BITFIELD_BIT(i)) {
+          /* We need to self-wait for all previously submitted jobs, and given
+@@ -688,6 +710,17 @@ emit_barrier_insert_waits(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
+ static void
+ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+ {
++   const uint32_t vt_bit = BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER);
++   const uint32_t frag_bit = BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT);
++
++   /* Anyone waiting on the vertex/tiler subqueue also expects everything it
++    * was asked to wait for: resolve a deferred wait first. */
++   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
++      if (i != PANVK_SUBQUEUE_VERTEX_TILER &&
++          (deps.dst[i].wait_subqueue_mask & vt_bit))
++         panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
++   }
++
+    uint32_t wait_subqueue_mask = 0;
+    uint32_t utrace_subqueue_mask = 0;
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+@@ -703,6 +736,19 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+          utrace_subqueue_mask |= BITFIELD_BIT(i);
+    }
+ 
++   /* The fragment subqueue still signals (it's in wait_subqueue_mask), but
++    * the vertex/tiler wait on it is recorded instead of emitted. */
++   static int no_lazy = -1;
++   if (no_lazy < 0)
++      no_lazy = debug_get_bool_option("PANVK_NO_LAZY_VT_WAIT", false);
++   const bool lazy_vt =
++      !no_lazy && !deps.vt_frag_wait_now &&
++      cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
++      !deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].conditional &&
++      (deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask & frag_bit);
++   if (lazy_vt)
++      deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask &= ~frag_bit;
++
+    u_foreach_bit(i, utrace_subqueue_mask)
+       panvk_per_arch(panvk_instr_begin_work)(i, cmdbuf,
+                                              PANVK_INSTR_WORK_TYPE_BARRIER);
+@@ -752,6 +798,13 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+       }
+    }
+ 
++   if (lazy_vt) {
++      struct panvk_cs_state *vt = &cmdbuf->state.cs[PANVK_SUBQUEUE_VERTEX_TILER];
++      vt->lazy_frag_wait = true;
++      vt->lazy_frag_sync_point =
++         cmdbuf->state.cs[PANVK_SUBQUEUE_FRAGMENT].relative_sync_point;
++   }
++
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+       struct cs_builder *b = panvk_get_cs_builder(cmdbuf, i);
+       struct cs_index tmp_regs = cs_scratch_reg_tuple(b, 0, 4);
+@@ -825,6 +878,31 @@ panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
+    emit_barrier_csf(cmdbuf, deps);
+ }
+ 
++void
++panvk_per_arch(cmd_flush_lazy_vt_wait)(struct panvk_cmd_buffer *cmdbuf)
++{
++   struct panvk_cs_state *vt = &cmdbuf->state.cs[PANVK_SUBQUEUE_VERTEX_TILER];
++
++   if (!vt->lazy_frag_wait)
++      return;
++
++   vt->lazy_frag_wait = false;
++
++   struct cs_builder *b =
++      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
++   struct cs_index sync_addr = cs_scratch_reg64(b, 0);
++   struct cs_index wait_val = cs_scratch_reg64(b, 2);
++
++   cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
++                offsetof(struct panvk_cs_subqueue_context, syncobjs));
++   cs_add_imm64(b, sync_addr, sync_addr,
++                sizeof(struct panvk_cs_sync64) * PANVK_SUBQUEUE_FRAGMENT);
++   cs_add_imm64(b, wait_val, cs_progress_seqno_reg(b, PANVK_SUBQUEUE_FRAGMENT),
++                vt->lazy_frag_sync_point);
++   panvk_instr_sync64_wait(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, false,
++                           MALI_CS_CONDITION_GREATER, wait_val, sync_addr);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+                                     const VkDependencyInfo *pDependencyInfo)
+@@ -1197,6 +1275,8 @@ panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, primary, commandBuffer);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(primary);
++
+    if (commandBufferCount == 0)
+       return;
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 00c5c5f3..dd47ac37 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -3025,6 +3025,14 @@ static VkResult
+ prepare_draw(struct panvk_cmd_buffer *cmdbuf,
+              const struct panvk_draw_info *draw)
+ {
++   /* A barrier may have deferred the vertex/tiler wait on fragment work:
++    * resolve it before shaders that may read memory written by it. */
++   if (draw->gpu_prerast_generated || cmdbuf->state.gfx.gs.shader ||
++       cmdbuf->state.gfx.tcs.shader || cmdbuf->state.gfx.tes.shader ||
++       !cmdbuf->state.gfx.vs.shader ||
++       cmdbuf->state.gfx.vs.shader->desc_info.mem_access)
++      panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
++
+    const struct panvk_shader_variant *vs =
+       raster_vs_variant(cmdbuf, draw->gpu_prerast_generated);
+    const struct panvk_shader_variant *fs =
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
+index 511be875..c648beb1 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
+@@ -18,6 +18,8 @@ panvk_per_arch(CmdResetEvent2)(VkCommandBuffer commandBuffer, VkEvent _event,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    VK_FROM_HANDLE(panvk_event, event, _event);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
++
+    /* Wrap stageMask with a VkDependencyInfo object so we can re-use
+     * add_cs_deps(). */
+    const VkMemoryBarrier2 barrier = {
+@@ -94,6 +96,8 @@ panvk_per_arch(CmdSetEvent2)(VkCommandBuffer commandBuffer, VkEvent _event,
+    VK_FROM_HANDLE(panvk_event, event, _event);
+    struct panvk_cs_deps deps = {0};
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
++
+    panvk_per_arch(add_cs_deps)(cmdbuf, pDependencyInfo, &deps, true);
+ 
+    /* vkCmdSetEvents() is not allowed to be called mid-render-pass */
+@@ -260,6 +264,8 @@ panvk_per_arch(CmdWaitEvents2)(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
++
+    for (uint32_t i = 0; i < eventCount; i++) {
+       VK_FROM_HANDLE(panvk_event, event, pEvents[i]);
+       const VkDependencyInfo *info = &pDependencyInfos[i];
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
+index 15d15b37..d95ab586 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
+@@ -1224,6 +1224,8 @@ panvk_per_arch(CmdResetQueryPool)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
+    if (queryCount == 0)
+       return;
+ 
+@@ -1253,6 +1255,8 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
+    assert(index == 0 ||
+           pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT);
+ 
+@@ -1286,6 +1290,8 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
+    assert(index == 0 ||
+           pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT);
+ 
+@@ -1319,6 +1325,8 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
+    panvk_cmd_write_timestamp_query(cmd, stage, pool, query);
+ }
+ 
+@@ -1332,6 +1340,8 @@ panvk_per_arch(CmdCopyQueryPoolResults)(
+    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
+    VK_FROM_HANDLE(panvk_buffer, dst_buffer, dstBuffer);
+ 
++   panvk_per_arch(cmd_flush_lazy_vt_wait)(cmd);
++
+    uint64_t dst_buffer_addr = panvk_buffer_gpu_ptr(dst_buffer, dstOffset);
+ 
+    switch (pool->vk.query_type) {
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index bf2904f4..0df6145d 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -388,6 +388,8 @@ struct panvk_shader_fau_info {
+ 
+ struct panvk_shader_desc_info {
+    uint32_t used_set_mask;
++   /* Some variant samples textures or accesses images, SSBOs or global memory. */
++   bool mem_access;
+ 
+ #if PAN_ARCH < 9
+    struct {
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 03ce28cc..deb4648b 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -2957,6 +2957,32 @@ panvk_lower_nir_io(nir_shader *nir)
+    pan_nir_lower_mediump_io(nir);
+ }
+ 
++/* Conservative: any texture instruction or image/SSBO/global/texel-buffer
++ * intrinsic counts. */
++static bool
++shader_accesses_memory(nir_shader *nir)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_tex)
++               return true;
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            const char *name =
++               nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name;
++            if (strstr(name, "invocation_id"))
++               continue;
++            if (strstr(name, "image") || strstr(name, "ssbo") ||
++                strstr(name, "global") || strstr(name, "texel") ||
++                strstr(name, "bindless"))
++               return true;
++         }
++      }
++   }
++   return false;
++}
++
+ static VkResult
+ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+                   VkShaderCreateFlagsEXT shader_flags,
+@@ -2969,6 +2995,11 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+    const bool dump_asm =
+       shader_flags & VK_SHADER_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_MESA;
+ 
++   /* Before pan_postprocess_nir(), which turns vertex outputs into global
++    * stores. */
++   if (desc_info)
++      desc_info->mem_access |= shader_accesses_memory(nir);
++
+    /* We're going to modify this so make our own copy to be nicer to callers */
+    struct pan_compile_inputs input = *compile_input;
+ 
+@@ -4150,6 +4181,7 @@ shader_desc_info_deserialize(struct panvk_device *dev,
+                              struct panvk_shader *shader)
+ {
+    shader->desc_info.used_set_mask = blob_read_uint32(blob);
++   shader->desc_info.mem_access = blob_read_uint8(blob);
+ 
+ #if PAN_ARCH < 9
+    shader->desc_info.dyn_ubos.count = blob_read_uint32(blob);
+@@ -4346,6 +4378,7 @@ shader_desc_info_serialize(struct blob *blob,
+                            const struct panvk_shader *shader)
+ {
+    blob_write_uint32(blob, shader->desc_info.used_set_mask);
++   blob_write_uint8(blob, shader->desc_info.mem_access);
+ 
+ #if PAN_ARCH < 9
+    blob_write_uint32(blob, shader->desc_info.dyn_ubos.count);
+-- 
+2.55.0
+

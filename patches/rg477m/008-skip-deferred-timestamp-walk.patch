@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:44:50 -0400
+Subject: [PATCH] panvk/csf: skip the deferred timestamp walk when no timestamp
+ was deferred
+
+Every render pass ends with a walk of the deferred timestamp query list on
+all three subqueues, a few memory round trips each, even when the pass wrote
+no timestamp. Only walk when this command buffer deferred a timestamp in the
+pass, executed secondaries, or the pass may hold timestamps deferred elsewhere
+(resumed or inherited render pass, secondary command buffer).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit 500ea24ffd25067d01a8848077b6bef31876bb29)
+
+Purpose: skip the per-render-pass walk of the deferred timestamp query list on all three subqueues when no timestamp was deferred
+Upstream-commit: none (generic PanVK CSF; upstream candidate)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none
+Validation test: drawbench loadpasses ~5% faster on its own; with csf-v11/191 see there; PanProbe 38/38
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c |  4 ++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   | 13 +++++++++++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_query.c  |  6 ++++--
+ src/panfrost/vulkan/panvk_cmd_draw.h          |  2 ++
+ 4 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index 30c8d52f..a77d528e 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -1284,6 +1284,10 @@ panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
+     * secondary command buffers. */
+    flush_sync_points(primary);
+ 
++   /* Secondaries inside a render pass can defer timestamp queries to its
++    * end. */
++   primary->state.gfx.render.has_deferred_ts = true;
++
+    for (uint32_t i = 0; i < commandBufferCount; i++) {
+       VK_FROM_HANDLE(panvk_cmd_buffer, secondary, pCommandBuffers[i]);
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 7131a694..1feed6c6 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -7511,6 +7511,19 @@ handle_deferred_queries(struct panvk_cmd_buffer *cmdbuf)
+ {
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+ 
++   /* Walking the deferred timestamp list costs a few memory round trips per
++    * subqueue on every render pass. Skip it unless this command buffer
++    * deferred a timestamp, or the pass may hold timestamps deferred
++    * elsewhere (resumed or inherited render pass, secondary command buffer).
++    */
++   if (!cmdbuf->state.gfx.render.has_deferred_ts &&
++       !(cmdbuf->state.gfx.render.flags & VK_RENDERING_RESUMING_BIT) &&
++       !inherits_render_ctx(cmdbuf) &&
++       cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY)
++      return;
++
++   cmdbuf->state.gfx.render.has_deferred_ts = false;
++
+    for (uint32_t sq = 0; sq < PANVK_SUBQUEUE_COUNT; ++sq) {
+       struct cs_builder *b = panvk_get_cs_builder(cmdbuf, sq);
+       struct cs_index current = cs_scratch_reg64(b, 0);
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
+index d95ab586..5b3029aa 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_query.c
+@@ -582,10 +582,12 @@ panvk_cmd_write_timestamp_query(struct panvk_cmd_buffer *cmd,
+    const bool defer =
+       in_rp && (write_sq_mask & BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT));
+ 
+-   if (defer)
++   if (defer) {
+       panvk_cs_defer_timestamp(cmd, stage, pool, query);
+-   else
++      cmd->state.gfx.render.has_deferred_ts = true;
++   } else {
+       panvk_cs_write_timestamp(cmd, stage, pool, query);
++   }
+ 
+    panvk_cs_write_ts_info(cmd, stage, pool, query);
+ 
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index 9943277a..f6d6a2d0 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -53,6 +53,8 @@ struct panvk_resolve_attachment {
+ 
+ struct panvk_rendering_state {
+    VkRenderingFlags flags;
++   /* A timestamp query was deferred to the end of the render pass. */
++   bool has_deferred_ts;
+    uint32_t layer_count;
+    uint32_t view_mask;
+    enum u_tristate first_provoking_vertex;
+-- 
+2.55.0
+

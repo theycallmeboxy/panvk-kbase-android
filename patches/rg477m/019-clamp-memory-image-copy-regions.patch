@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 13:00:25 -0400
+Subject: [PATCH] panvk: clamp memory<->image copy regions to the range they
+ were given
+
+A buffer-to-image (or image-to-buffer) copy region that extends past the
+memory range passed with it is invalid, but layers above the driver do
+record them: Descenders (Unity, through DXVK and GameNative's Vulkan
+wrapper) uploads a 2048x1152 RGBA8 texture from a buffer that has 8 MiB
+left after the region's offset, while the region needs 9 MiB. The copy
+shader then reads 1 MiB past the end of the buffer.
+
+Whether those reads hit mapped memory depends on what kbase placed next to
+the buffer. SAME_VA regions are packed top-down with holes between them
+(executable regions keep their CPU mapping there but are GPU-mapped
+elsewhere), so with a different allocation history the reads land in a
+hole, the GPU takes a translation fault and the device is lost. Allocating
+the gpu_prerast arenas lazily changed that history enough for Descenders
+to fault on every launch; a debug build with an unmapped guard page under
+every buffer made it fault on every build.
+
+The bytes past the range are undefined anyway, so shrink such regions to
+the range, whole slices first, then rows, and warn once. Image-to-memory
+copies get the same treatment, since there the copy would write past the
+range.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit 25b96b2694a3f58893bf2edcf5e53ad12ee09ccd)
+
+Purpose: shrink buffer<->image copy regions that run past the memory range they were given (invalid usage seen from Descenders through DXVK/GameNative: a 2048x1152 RGBA8 upload needing 9 MiB from a buffer with 8 MiB left), so the copy shader no longer reads (or, for image-to-buffer, writes) past the end of the buffer; on kbase those accesses fault whenever a hole sits next to the buffer, losing the device
+Upstream-commit: none (Mesa main has the same copy path without a range check)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none of ours; applies on the full g615-v11-csf series
+Validation test: Descenders faulted (CS translation fault) on every launch with rg477m/018 and now runs to the memory cap with no fault (2/2 runs, plus a debug build with an unmapped guard page under every buffer); guard-page sweep of 18 other games found no other out-of-bounds GPU access; PanProbe 38/38; drawbench 8/8 checksums, racetest 11 modes and msrtss identical
+Generated-by: LLM
+---
+ src/panfrost/vulkan/panvk_vX_cmd_meta.c | 139 ++++++++++++++++++++++++
+ 1 file changed, 139 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index d95f3a88..81d94350 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -420,6 +420,120 @@ panvk_per_arch(CmdCopyMemoryKHR)(VkCommandBuffer commandBuffer,
+    meta_compute_end(cmdbuf, &save);
+ }
+ 
++/* Memory <-> image copies whose regions run past the memory range they were
++ * given are invalid, but they happen: Descenders (Unity, through DXVK and
++ * GameNative's Vulkan wrapper) uploads a 2048x1152 RGBA8 texture from a
++ * buffer with 8 MiB left after the region's offset, while the region needs
++ * 9 MiB. The copy shader then reads past the end of the buffer. On kbase,
++ * buffers are placed back to back with holes between them, so whether the
++ * extra reads land on mapped memory depends on what was allocated around the
++ * buffer; when they don't, the GPU faults and the device is lost. The bytes
++ * past the range are undefined either way, so shrink such regions to the
++ * range: whole slices first, then rows. An image-to-memory copy would write
++ * past the range instead, so the same applies there. */
++static bool
++memory_image_region_clamp(const struct panvk_image *img,
++                          VkDeviceMemoryImageCopyKHR *r)
++{
++   if (r->addressRange.size == VK_WHOLE_SIZE)
++      return false;
++
++   const VkFormat fmt = vk_format_get_aspect_format(
++      img->vk.format, r->imageSubresource.aspectMask);
++   const enum pipe_format pfmt = vk_format_to_pipe_format(fmt);
++   const uint32_t blk_w = util_format_get_blockwidth(pfmt);
++   const uint32_t blk_h = util_format_get_blockheight(pfmt);
++   const uint64_t blk_B = util_format_get_blocksize(pfmt);
++   const uint32_t w_blk = DIV_ROUND_UP(r->imageExtent.width, blk_w);
++   const uint32_t h_blk = DIV_ROUND_UP(r->imageExtent.height, blk_h);
++   const uint64_t row_B =
++      DIV_ROUND_UP(r->addressRowLength ? r->addressRowLength
++                                       : r->imageExtent.width,
++                   blk_w) *
++      blk_B;
++   const uint64_t slice_B =
++      DIV_ROUND_UP(r->addressImageHeight ? r->addressImageHeight
++                                         : r->imageExtent.height,
++                   blk_h) *
++      row_B;
++   const bool is_3d = img->vk.image_type == VK_IMAGE_TYPE_3D;
++   const uint32_t slices =
++      is_3d ? r->imageExtent.depth
++            : vk_image_subresource_layer_count(&img->vk, &r->imageSubresource);
++   const uint64_t size = r->addressRange.size;
++
++   if (!w_blk || !h_blk || !slices)
++      return false;
++
++   const uint64_t slice_end = (uint64_t)(h_blk - 1) * row_B + w_blk * blk_B;
++   if ((uint64_t)(slices - 1) * slice_B + slice_end <= size)
++      return false;
++
++   if (size >= slice_end) {
++      /* Keep the whole slices that fit. */
++      const uint32_t fit = slice_B ? 1 + (size - slice_end) / slice_B : slices;
++      if (is_3d)
++         r->imageExtent.depth = MIN2(fit, slices);
++      else
++         r->imageSubresource.layerCount = MIN2(fit, slices);
++   } else {
++      /* Not even one slice: keep the rows of the first one that fit. */
++      const uint32_t rows =
++         size >= w_blk * blk_B ? 1 + (size - w_blk * blk_B) / row_B : 0;
++      r->imageExtent.height = MIN2(rows * blk_h, r->imageExtent.height);
++      if (is_3d)
++         r->imageExtent.depth = 1;
++      else
++         r->imageSubresource.layerCount = 1;
++   }
++
++   return true;
++}
++
++static bool
++memory_image_copy_clamp(const struct panvk_image *img,
++                        const VkCopyDeviceMemoryImageInfoKHR *info,
++                        VkDeviceMemoryImageCopyKHR *regions,
++                        VkCopyDeviceMemoryImageInfoKHR *out)
++{
++   static bool warned;
++   bool clamped = false;
++   uint32_t count = 0;
++
++   for (uint32_t i = 0; i < info->regionCount; i++) {
++      VkDeviceMemoryImageCopyKHR r = info->pRegions[i];
++
++      if (memory_image_region_clamp(img, &r))
++         clamped = true;
++      if (r.imageExtent.width && r.imageExtent.height && r.imageExtent.depth)
++         regions[count++] = r;
++   }
++
++   if (clamped && !warned) {
++      warned = true;
++      mesa_logw("panvk: copy region runs past the memory range it was given; "
++                "clamped to the range");
++   }
++
++   *out = *info;
++   out->regionCount = count;
++   out->pRegions = regions;
++   return clamped;
++}
++
++static bool
++memory_image_copy_overruns(const struct panvk_image *img,
++                           const VkCopyDeviceMemoryImageInfoKHR *info)
++{
++   for (uint32_t i = 0; i < info->regionCount; i++) {
++      VkDeviceMemoryImageCopyKHR r = info->pRegions[i];
++
++      if (memory_image_region_clamp(img, &r))
++         return true;
++   }
++   return false;
++}
++
+ static bool
+ lower_copy_memory_to_image(
+    VkCommandBuffer commandBuffer,
+@@ -1772,6 +1886,18 @@ panvk_per_arch(CmdCopyMemoryToImageKHR)(
+    VK_FROM_HANDLE(panvk_image, bc_img, pCopyMemoryInfo->image);
+    const VkDeviceMemoryImageCopyKHR *r0 = &pCopyMemoryInfo->pRegions[0];
+ 
++   if (memory_image_copy_overruns(bc_img, pCopyMemoryInfo)) {
++      STACK_ARRAY(VkDeviceMemoryImageCopyKHR, regions,
++                  pCopyMemoryInfo->regionCount);
++      VkCopyDeviceMemoryImageInfoKHR clamped;
++
++      memory_image_copy_clamp(bc_img, pCopyMemoryInfo, regions, &clamped);
++      if (clamped.regionCount)
++         panvk_per_arch(CmdCopyMemoryToImageKHR)(commandBuffer, &clamped);
++      STACK_ARRAY_FINISH(regions);
++      return;
++   }
++
+    if (bc_img->bc_gfx) {
+       VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+       struct panvk_cmd_meta_graphics_save_ctx save = {0};
+@@ -1942,6 +2068,19 @@ panvk_per_arch(CmdCopyImageToMemoryKHR)(
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    VK_FROM_HANDLE(panvk_image, img, pCopyMemoryInfo->image);
++
++   if (memory_image_copy_overruns(img, pCopyMemoryInfo)) {
++      STACK_ARRAY(VkDeviceMemoryImageCopyKHR, regions,
++                  pCopyMemoryInfo->regionCount);
++      VkCopyDeviceMemoryImageInfoKHR clamped;
++
++      memory_image_copy_clamp(img, pCopyMemoryInfo, regions, &clamped);
++      if (clamped.regionCount)
++         panvk_per_arch(CmdCopyImageToMemoryKHR)(commandBuffer, &clamped);
++      STACK_ARRAY_FINISH(regions);
++      return;
++   }
++
+    struct vk_meta_copy_image_properties img_props =
+       panvk_meta_copy_get_image_properties(img, false, false);
+    struct panvk_cmd_meta_compute_save_ctx save = {0};
+-- 
+2.55.0
+

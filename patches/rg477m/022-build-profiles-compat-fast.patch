@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:22:18 -0400
+Subject: [PATCH] panvk: add a compat/fast build profile for the defaults of
+ trade-off switches
+
+Some switches trade valid but rarely used Vulkan behaviour for memory or
+speed. A build that should have them on needed an environment variable
+per game.
+
+New meson option panvk-profile (compat or fast, default compat). It sets
+PANVK_PROFILE_FAST, the compiled-in default of such switches; the
+environment variable still overrides it per process in either build.
+driverInfo names the profile ("PanVK-kbase dev compat (Mesa ...)").
+
+compat: every default is conformant. PANVK_BC_RAW defaults to store, so
+reading the raw blocks of a BC image back is exact.
+fast: PANVK_BC_RAW defaults to lazy (upstream's default since
+csf-v11/207): readable BC1-BC5 images keep no raw blocks until the device
+first reads one back, which skips that first read with a warning.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: build profiles: meson option panvk-profile=compat|fast sets the compiled-in default of switches that trade conformance for memory or speed (compat: PANVK_BC_RAW=store, exact raw readback; fast: PANVK_BC_RAW=lazy, upstream's default since csf-v11/207); env variables still override per process; driverInfo names the profile. Fork scripts/build-android.sh passes it with --panvk-profile
+Upstream-commit: none (fork build option)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: csf-v11/201, 207 (PANVK_BC_RAW); applies on the full g615-v11-csf series after rg477m/021
+Validation test: (RC5 base, pending device run) PanProbe compat and fast; driverInfo "PanVK-kbase <release> compat|fast (Mesa ...)"
+Generated-by: LLM
+---
+ meson.options                                  | 11 +++++++++++
+ src/panfrost/vulkan/meson.build                |  2 ++
+ src/panfrost/vulkan/panvk_image.c              | 16 +++++++++-------
+ src/panfrost/vulkan/panvk_vX_physical_device.c |  4 ++--
+ 4 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/meson.options b/meson.options
+index 36e090cc..8f260855 100644
+--- a/meson.options
++++ b/meson.options
+@@ -236,6 +236,17 @@ option(
+                 'gallium and vulkan driver',
+ )
+ 
++option(
++  'panvk-profile',
++  type : 'combo',
++  value : 'compat',
++  choices : ['compat', 'fast'],
++  description : 'Compiled-in defaults of PanVK-kbase switches. compat: only ' +
++                'conformant behaviour. fast: also enables tested trade-offs ' +
++                'that break rarely used valid Vulkan (each switch can still ' +
++                'be set per process with its environment variable).',
++)
++
+ option(
+   'amdgpu-virtio',
+   type : 'boolean',
+diff --git a/src/panfrost/vulkan/meson.build b/src/panfrost/vulkan/meson.build
+index 437a8e73..55181b33 100644
+--- a/src/panfrost/vulkan/meson.build
++++ b/src/panfrost/vulkan/meson.build
+@@ -70,6 +70,8 @@ libpanvk_files += [sha1_h]
+ 
+ panvk_deps = []
+ panvk_flags = []
++# compat or fast: the compiled-in default of switches that trade conformance for memory or speed
++panvk_flags += '-DPANVK_PROFILE_FAST=@0@'.format(get_option('panvk-profile') == 'fast' ? 1 : 0)
+ panvk_per_arch_libs = []
+ 
+ bifrost_archs = [6, 7]
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index 811788c6..6a7a45a1 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -884,11 +884,12 @@ panvk_bc_lowmem_astc(const struct panvk_physical_device *phys_dev,
+            pan_query_compressed_formats(&phys_dev->kmod.dev->props));
+ }
+ 
+-/* PANVK_BC_RAW=lazy (default since csf-v11/207) | store | plane: lazy
+- * gives readable BC1-BC5 images no raw blocks until the device first
+- * reads a BC image back (bc_raw_lazy), store keeps a raw store for every
+- * readable image (csf-v11/201-206), plane keeps the raw blocks in the
+- * image memory. */
++/* PANVK_BC_RAW=lazy | store | plane: lazy gives readable BC1-BC5 images
++ * no raw blocks until the device first reads a BC image back (bc_raw_lazy),
++ * store keeps a raw store for every readable image (csf-v11/201-206), plane
++ * keeps the raw blocks in the image memory. lazy breaks the first raw
++ * readback, so it is the default only in the fast build profile; compat
++ * defaults to store. */
+ static bool
+ panvk_bc_raw_lazy_mode(void)
+ {
+@@ -896,7 +897,7 @@ panvk_bc_raw_lazy_mode(void)
+ 
+    if (p_atomic_read(&lazy) < 0) {
+       const char *mode = os_get_option("PANVK_BC_RAW");
+-      p_atomic_set(&lazy, !mode || !strcmp(mode, "lazy"));
++      p_atomic_set(&lazy, mode ? !strcmp(mode, "lazy") : PANVK_PROFILE_FAST);
+    }
+    return p_atomic_read(&lazy);
+ }
+@@ -914,7 +915,8 @@ panvk_bc_raw_store_wanted(const struct panvk_image *image)
+ 
+       if (mode && strcmp(mode, "store") && strcmp(mode, "plane") &&
+           strcmp(mode, "lazy"))
+-         mesa_logw("panvk: unknown PANVK_BC_RAW=%s, using lazy", mode);
++         mesa_logw("panvk: unknown PANVK_BC_RAW=%s, using %s", mode,
++                   PANVK_PROFILE_FAST ? "lazy" : "store");
+       p_atomic_set(&min_B,
+                    (mode && !strcmp(mode, "plane")) ? INT64_MAX : MAX2(v, 0));
+    }
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index a045707c..9c69ea05 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -1402,8 +1402,8 @@ panvk_per_arch(get_physical_device_properties)(
+ 
+    snprintf(properties->driverName, VK_MAX_DRIVER_NAME_SIZE, "panvk");
+    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
+-            "PanVK-kbase " PANVK_KBASE_RELEASE " (Mesa " PACKAGE_VERSION
+-            MESA_GIT_SHA1 ")");
++            "PanVK-kbase " PANVK_KBASE_RELEASE " %s (Mesa " PACKAGE_VERSION
++            MESA_GIT_SHA1 ")", PANVK_PROFILE_FAST ? "fast" : "compat");
+ 
+    /* VK_EXT_physical_device_drm */
+    if (device->drm.primary_rdev) {
+-- 
+2.55.0
+

@@ -17,6 +17,8 @@ if [ "$FRONTEND" = "CSF" ]; then SERIES="$SERIES csf csf-v$ARCH"; else SERIES="$
 # Universal ICD: jm-v9 sits on top of the csf-v11 series (v9 JM + v10-v14 CSF),
 # jm-v7 (Bifrost v6/v7 kbase unblock) on top of jm-v9.
 if [ "$PROFILE" = "g615-v11-csf" ]; then SERIES="$SERIES jm-v9 jm-v7"; fi
+# rg477m fork: our fixes, applied last, numbered in our own namespace so upstream numbering never collides.
+[ -d "$ROOT/patches/rg477m" ] && SERIES="$SERIES rg477m"
 echo "profile=$PROFILE arch=$ARCH frontend=$FRONTEND series: $SERIES"
 git -C "$MESA" status --porcelain | head -n 5
 APPLIED=0

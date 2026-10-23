@@ -1,0 +1,672 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 21:10:08 -0400
+Subject: [PATCH] panvk/csf: elide redundant barrier syncs and idle compute
+ subqueue work
+
+Graphics barriers (render pass dependencies, layout transitions, most
+"render target becomes a texture" barriers) usually have ALL_COMMANDS or
+all shader stages in a scope, so every barrier made all three subqueues
+self-wait, flush and signal, and wait on each other, even when the compute
+subqueue never runs anything. Within a primary command buffer:
+
+- A wait on a sync point a subqueue already waited for unconditionally is
+  skipped (sync points only grow, each subqueue runs in order).
+- A barrier cache flush is skipped when the subqueue emitted nothing but
+  barrier syncs since a flush that covers it (flushes already come before
+  a barrier's waits).
+- A compute subqueue that did nothing since its last barrier signal but wait
+  is idle: it skips its self-wait and signal (that signal still covers its
+  work), and subqueues that would wait on it wait on what it waited for
+  instead, so dependency chains through it hold.
+- An idle compute subqueue defers its waits and cache flushes from
+  vkCmdPipelineBarrier2 until it is next used (panvk_get_cs_builder()): a
+  blocked wait is re-checked on every signal of the subqueue it waits on.
+  At the end of the command buffer the waits are dropped (the flush is
+  kept); every primary starts with the compute subqueue owing waits on all
+  earlier vertex/tiler and fragment work.
+
+PANVK_NO_SYNC_ELISION=1 turns this off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit 9c3ab5e838a727b2d754188e9a4e8d4786d5ca1f)
+
+Purpose: skip redundant barrier waits and flushes, and keep the idle compute subqueue out of graphics barriers (deferred waits and flushes)
+Upstream-commit: none (generic PanVK CSF; upstream candidate)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/006, rg477m/008
+Validation test: with csf-v11/190: drawbench loadpasses 64 at 1255 MHz 2.66 -> 1.22 ms (DDK 0.64); Hades Vulkan renderer 1255 MHz 123.4 -> 160.0 fps, normal clocks 31.4 -> 51.5 fps (DDK 132.2 / 37.2); Hades DXVK and Serious Sam unchanged; racetest (render pass -> compute/vertex shader, same/cross command buffer/submit, chains) 0/100 stale, no-barrier controls 100/100; drawbench image checksums unchanged; PanProbe 38/38; no GPU faults
+Generated-by: LLM
+---
+ src/panfrost/genxml/cs_builder.h              |   6 +
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h    |  43 ++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 379 +++++++++++++++---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   |   6 +-
+ 4 files changed, 378 insertions(+), 56 deletions(-)
+
+diff --git a/src/panfrost/genxml/cs_builder.h b/src/panfrost/genxml/cs_builder.h
+index 93201b5b..cfd839c3 100644
+--- a/src/panfrost/genxml/cs_builder.h
++++ b/src/panfrost/genxml/cs_builder.h
+@@ -207,6 +207,10 @@ struct cs_builder {
+    /* Mask of resources required by this CS. */
+    uint32_t req_resource_mask;
+ 
++   /* Number of instructions emitted so far, to tell whether anything was
++    * emitted between two points. */
++   uint64_t ins_count;
++
+    /* Temporary storage for inner blocks that need to be built
+     * and copied in one monolithic sequence of instructions with no
+     * jump in the middle.
+@@ -607,6 +611,8 @@ cs_reserve_instrs(struct cs_builder *b, uint32_t num_instrs)
+ static inline void *
+ cs_alloc_ins_block(struct cs_builder *b, uint32_t num_instrs)
+ {
++   b->ins_count += num_instrs;
++
+    if (cs_cur_block(b))
+       return util_dynarray_grow(&b->blocks.instrs, uint64_t, num_instrs);
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index 01904749..e8c1a82f 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -305,6 +305,12 @@ struct panvk_cs_deps {
+ 
+    struct panvk_cs_crc_deps crc;
+ 
++   /* The barrier comes from vkCmdPipelineBarrier2: waits of an idle compute
++    * subqueue may be deferred to its next work (see
++    * panvk_per_arch(cmd_flush_lazy_compute)). Internal barriers keep using a
++    * builder they got before, so they can't. */
++   bool may_defer_compute;
++
+    /* The vertex/tiler subqueue must wait for the fragment subqueue right away
+     * (it may read the data in a stage other than a pre-rasterization shader).
+     */
+@@ -493,6 +499,35 @@ struct panvk_cs_state {
+    bool lazy_frag_wait;
+    int32_t lazy_frag_sync_point;
+ 
++   /* Highest relative sync point of each subqueue this subqueue waited for
++    * unconditionally since the sync points were last flushed, plus one (0:
++    * none). A later wait on the same or an earlier point is redundant.
++    */
++   int32_t waited_sync_point[PANVK_SUBQUEUE_COUNT];
++
++   /* Compute only: true while the subqueue has done nothing since its last
++    * barrier signal but wait on other subqueues (idle_ins_count is the
++    * instruction count after those waits). Such a subqueue skips its
++    * self-wait and signal in later barriers, and subqueues that would wait
++    * on it wait on what it waited for instead (idle_waits, points plus one).
++    */
++   bool idle;
++   uint64_t idle_ins_count;
++   int32_t idle_waits[PANVK_SUBQUEUE_COUNT];
++
++   /* Cache flush done by the last barrier on this subqueue, and the
++    * instruction count after that barrier. While nothing but barriers was
++    * emitted since, a barrier asking for no more than that flush skips it. */
++   bool flush_valid;
++   uint64_t flush_ins_count;
++   struct panvk_cache_flush_info last_flush;
++
++   /* Compute only: waits (points plus one) and cache flushes an idle compute
++    * subqueue deferred until it is next used (panvk_get_cs_builder()). */
++   bool lazy_waits;
++   int32_t lazy_wait_points[PANVK_SUBQUEUE_COUNT];
++   struct panvk_cache_flush_info lazy_flush;
++
+    struct cs_tracing_ctx tracing;
+ };
+ 
+@@ -742,9 +777,17 @@ inherits_render_ctx(struct panvk_cmd_buffer *cmdbuf)
+           (cmdbuf->state.gfx.render.flags & VK_RENDERING_RESUMING_BIT);
+ }
+ 
++void panvk_per_arch(cmd_flush_lazy_compute)(struct panvk_cmd_buffer *cmdbuf);
++
+ static inline struct cs_builder *
+ panvk_get_cs_builder(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
+ {
++   /* Whatever is emitted on the compute subqueue next must come after the
++    * waits it deferred while idle. */
++   if (subqueue == PANVK_SUBQUEUE_COMPUTE &&
++       cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE].lazy_waits)
++      panvk_per_arch(cmd_flush_lazy_compute)(cmdbuf);
++
+    return &cmdbuf->state.cs[subqueue].builder;
+ }
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index a77d528e..430664ab 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -146,6 +146,42 @@ emit_tls(struct panvk_cmd_buffer *cmdbuf)
+    }
+ }
+ 
++/* Barrier sync elision (emit_barrier_csf()), primary command buffers only. */
++static bool
++sync_elision_enabled(const struct panvk_cmd_buffer *cmdbuf)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_SYNC_ELISION", false);
++
++   return !disabled && cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++}
++
++static void
++emit_cache_flush(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
++                 enum panvk_subqueue_id i,
++                 const struct panvk_cache_flush_info *cache_flush)
++{
++   struct cs_index flush_id = cs_scratch_reg32(b, 0);
++
++   panvk_per_arch(panvk_instr_begin_work)(i, cmdbuf,
++                                          PANVK_INSTR_WORK_TYPE_FLUSH_CACHE);
++   cs_move32_to(b, flush_id, 0);
++   cs_flush_caches(b, cache_flush->l2, cache_flush->lsc, cache_flush->others,
++                   flush_id, cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
++   cs_wait_slot(b, SB_ID(IMM_FLUSH));
++   struct panvk_instr_end_args instr_info_flush = {
++      .flush_cache = {
++         .l2 = cache_flush->l2,
++         .lsc = cache_flush->lsc,
++         .other = cache_flush->others,
++      }};
++   panvk_per_arch(panvk_instr_end_work)(i, cmdbuf,
++                                        PANVK_INSTR_WORK_TYPE_FLUSH_CACHE,
++                                        &instr_info_flush);
++}
++
+ /**
+  * Write all sync point updates to seqno registers and reset the relative sync
+  * points to 0.
+@@ -175,8 +211,18 @@ flush_sync_points(struct panvk_cmd_buffer *cmdbuf)
+       }
+    }
+ 
+-   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++)
+-      cmdbuf->state.cs[i].relative_sync_point = 0;
++   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
++      struct panvk_cs_state *cs_state = &cmdbuf->state.cs[i];
++
++      cs_state->relative_sync_point = 0;
++
++      /* Recorded waits are relative to the old sync points. The deferred
++       * compute waits were emitted by panvk_get_cs_builder() above. */
++      assert(!cs_state->lazy_waits);
++      memset(cs_state->waited_sync_point, 0,
++             sizeof(cs_state->waited_sync_point));
++      cs_state->idle = false;
++   }
+ }
+ 
+ static void
+@@ -329,6 +375,26 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+ 
+    panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
+ 
++   /* Nothing else runs on the compute subqueue in this command buffer: drop
++    * the waits it deferred instead of blocking it until the other subqueues
++    * finish (a blocked wait is re-checked on each of their signals). The
++    * next primary command buffer assumes them (BeginCommandBuffer). Its
++    * deferred cache flush can't be assumed, so emit it: barriers flush
++    * before their waits anyway.
++    */
++   if (sync_elision_enabled(cmdbuf)) {
++      struct panvk_cs_state *cq_state =
++         &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE];
++
++      if (!panvk_cache_flush_is_nop(&cq_state->lazy_flush))
++         emit_cache_flush(&cq_state->builder, cmdbuf, PANVK_SUBQUEUE_COMPUTE,
++                          &cq_state->lazy_flush);
++      cq_state->lazy_waits = false;
++      memset(cq_state->lazy_wait_points, 0,
++             sizeof(cq_state->lazy_wait_points));
++      memset(&cq_state->lazy_flush, 0, sizeof(cq_state->lazy_flush));
++   }
++
+    /* Finishing queries requires a barrier. We don't want to do that more
+     * often than necessary. At the end of a primary is usually enough.
+     * Additionally, simultaneous use secondaries also need to flush if they
+@@ -547,9 +613,12 @@ collect_cs_deps(struct panvk_cmd_buffer *cmdbuf, const VkDependencyInfo *info,
+ 
+    /* A vertex/tiler wait on fragment work can be deferred when the
+     * vertex/tiler side of the second scope is only pre-rasterization shader
+-    * stages: it then only matters for draws whose shaders access memory. */
++    * stages: it then only matters for draws whose shaders access memory.
++    * A wait on an idle compute subqueue can turn into a wait on fragment
++    * work (emit_barrier_csf()), so evaluate it for compute waits too. */
+    if (wait_masks[PANVK_SUBQUEUE_VERTEX_TILER] &
+-       BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT)) {
++       (BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT) |
++        BITFIELD_BIT(PANVK_SUBQUEUE_COMPUTE))) {
+       const VkPipelineStageFlags2 lazy_ok =
+          VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+          VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+@@ -684,26 +753,96 @@ panvk_per_arch(add_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
+    }
+ }
+ 
++/* Make subqueue i wait until subqueue j reaches a relative sync point. Sync
++ * points only grow and a subqueue runs its stream in order, so a wait on a
++ * point this subqueue already waited for unconditionally is skipped.
++ */
++static void
++emit_subqueue_wait(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
++                   enum panvk_subqueue_id i, enum panvk_subqueue_id j,
++                   int32_t sync_point, struct cs_index tmp_regs)
++{
++   struct panvk_cs_state *cs_state = &cmdbuf->state.cs[i];
++   const bool elide = sync_elision_enabled(cmdbuf);
++
++   assert(tmp_regs.size == 4);
++
++   if (elide && cs_state->waited_sync_point[j] > sync_point)
++      return;
++
++   struct cs_index sync_addr = cs_reg64(b, tmp_regs.reg);
++   struct cs_index wait_val = cs_reg64(b, tmp_regs.reg + 2);
++
++   cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
++                offsetof(struct panvk_cs_subqueue_context, syncobjs));
++   cs_add_imm64(b, sync_addr, sync_addr, sizeof(struct panvk_cs_sync64) * j);
++
++   cs_add_imm64(b, wait_val, cs_progress_seqno_reg(b, j), sync_point);
++
++   panvk_instr_sync64_wait(cmdbuf, i, false, MALI_CS_CONDITION_GREATER,
++                           wait_val, sync_addr);
++
++   /* Waits inside a block (cs_if, loops) may not run. */
++   if (elide && !cs_cur_block(b))
++      cs_state->waited_sync_point[j] =
++         MAX2(cs_state->waited_sync_point[j], sync_point + 1);
++}
++
++static bool
++cache_flush_covers(const struct panvk_cache_flush_info *done,
++                   const struct panvk_cache_flush_info *flush)
++{
++   return !(flush->l2 & ~done->l2) && !(flush->lsc & ~done->lsc) &&
++          !(flush->others & ~done->others);
++}
++
++/* Emit the waits and cache flushes an idle compute subqueue deferred
++ * (emit_barrier_csf()). Called by panvk_get_cs_builder() before anything
++ * else is emitted on the compute subqueue.
++ */
++void
++panvk_per_arch(cmd_flush_lazy_compute)(struct panvk_cmd_buffer *cmdbuf)
++{
++   const enum panvk_subqueue_id cq = PANVK_SUBQUEUE_COMPUTE;
++   struct panvk_cs_state *cq_state = &cmdbuf->state.cs[cq];
++   struct cs_builder *b = &cq_state->builder;
++
++   if (!cq_state->lazy_waits)
++      return;
++
++   cq_state->lazy_waits = false;
++
++   for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
++      if (cq_state->lazy_wait_points[j])
++         emit_subqueue_wait(b, cmdbuf, cq, j,
++                            cq_state->lazy_wait_points[j] - 1,
++                            cs_scratch_reg_tuple(b, 0, 4));
++   }
++
++   if (!panvk_cache_flush_is_nop(&cq_state->lazy_flush))
++      emit_cache_flush(b, cmdbuf, cq, &cq_state->lazy_flush);
++
++   memset(cq_state->lazy_wait_points, 0, sizeof(cq_state->lazy_wait_points));
++   memset(&cq_state->lazy_flush, 0, sizeof(cq_state->lazy_flush));
++}
++
+ static void
+ emit_barrier_insert_waits(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
+                           struct panvk_cs_deps *deps, enum panvk_subqueue_id i,
++                          const int32_t *inherited_waits,
+                           struct cs_index tmp_regs)
+ {
+-   assert(tmp_regs.size == 4);
+    u_foreach_bit(j, deps->dst[i].wait_subqueue_mask) {
+-      struct panvk_cs_state *cs_state = &cmdbuf->state.cs[j];
+-      struct cs_index sync_addr = cs_reg64(b, tmp_regs.reg);
+-      struct cs_index wait_val = cs_reg64(b, tmp_regs.reg + 2);
+-
+-      cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
+-                   offsetof(struct panvk_cs_subqueue_context, syncobjs));
+-      cs_add_imm64(b, sync_addr, sync_addr, sizeof(struct panvk_cs_sync64) * j);
++      emit_subqueue_wait(b, cmdbuf, i, j,
++                         cmdbuf->state.cs[j].relative_sync_point, tmp_regs);
++   }
+ 
+-      cs_add_imm64(b, wait_val, cs_progress_seqno_reg(b, j),
+-                   cs_state->relative_sync_point);
++   if (!inherited_waits)
++      return;
+ 
+-      panvk_instr_sync64_wait(cmdbuf, i, false, MALI_CS_CONDITION_GREATER,
+-                              wait_val, sync_addr);
++   for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
++      if (j != i && inherited_waits[j])
++         emit_subqueue_wait(b, cmdbuf, i, j, inherited_waits[j] - 1, tmp_regs);
+    }
+ }
+ 
+@@ -721,6 +860,51 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+          panvk_per_arch(cmd_flush_lazy_vt_wait)(cmdbuf);
+    }
+ 
++   /* The compute subqueue only relays most graphics barriers: their first
++    * scope (e.g. ALL_COMMANDS) makes it self-wait and signal, and other
++    * subqueues wait on it. When it did nothing since its last signal but
++    * wait on other subqueues, that signal still covers all its work: skip
++    * the self-wait and signal, and give whoever waits on it the waits it
++    * did since, so dependency chains through it hold.
++    *
++    * An idle compute subqueue also defers its own waits and cache flushes
++    * from vkCmdPipelineBarrier2 until it is next used: a blocked wait
++    * costs even when nothing runs after it.
++    */
++   const enum panvk_subqueue_id cq = PANVK_SUBQUEUE_COMPUTE;
++   struct panvk_cs_state *cq_state = &cmdbuf->state.cs[cq];
++   struct cs_builder *cq_b = &cq_state->builder;
++   const bool elide = sync_elision_enabled(cmdbuf);
++   bool cq_idle = elide && cq_state->idle &&
++                  cq_b->ins_count == cq_state->idle_ins_count;
++   const bool cq_defer =
++      elide && deps.may_defer_compute && !deps.dst[cq].conditional;
++   int32_t cq_waits[PANVK_SUBQUEUE_COUNT] = {0};
++   bool cq_skip = false;
++
++   if (cq_state->lazy_waits && !(cq_idle && cq_defer)) {
++      panvk_per_arch(cmd_flush_lazy_compute)(cmdbuf);
++      cq_idle = false;
++   }
++
++   if (cq_idle && cq_defer) {
++      struct panvk_cache_flush_info *flush = &deps.src[cq].cache_flush;
++
++      cq_state->lazy_flush.l2 |= flush->l2;
++      cq_state->lazy_flush.lsc |= flush->lsc;
++      cq_state->lazy_flush.others |= flush->others;
++      if (!panvk_cache_flush_is_nop(flush))
++         cq_state->lazy_waits = true;
++      memset(flush, 0, sizeof(*flush));
++   }
++
++   if (cq_idle && deps.src[cq].wait_sb_mask) {
++      memcpy(cq_waits, cq_state->idle_waits, sizeof(cq_waits));
++      deps.src[cq].wait_sb_mask = 0;
++      deps.dst[cq].wait_subqueue_mask &= ~BITFIELD_BIT(cq);
++      cq_skip = true;
++   }
++
+    uint32_t wait_subqueue_mask = 0;
+    uint32_t utrace_subqueue_mask = 0;
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+@@ -741,47 +925,63 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+    static int no_lazy = -1;
+    if (no_lazy < 0)
+       no_lazy = debug_get_bool_option("PANVK_NO_LAZY_VT_WAIT", false);
+-   const bool lazy_vt =
++   const bool vt_may_defer =
+       !no_lazy && !deps.vt_frag_wait_now &&
+       cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+-      !deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].conditional &&
++      !deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].conditional;
++   const bool lazy_vt =
++      vt_may_defer &&
+       (deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask & frag_bit);
+    if (lazy_vt)
+       deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask &= ~frag_bit;
+ 
++   /* A fragment wait the vertex/tiler subqueue inherits from an idle compute
++    * subqueue can be deferred the same way. */
++   int32_t vt_lazy_inherited = 0;
++   if (vt_may_defer && cq_skip && cq_waits[PANVK_SUBQUEUE_FRAGMENT] &&
++       (deps.dst[PANVK_SUBQUEUE_VERTEX_TILER].wait_subqueue_mask &
++        BITFIELD_BIT(cq)))
++      vt_lazy_inherited = cq_waits[PANVK_SUBQUEUE_FRAGMENT];
++
+    u_foreach_bit(i, utrace_subqueue_mask)
+       panvk_per_arch(panvk_instr_begin_work)(i, cmdbuf,
+                                              PANVK_INSTR_WORK_TYPE_BARRIER);
+ 
++   /* Subqueues that emitted nothing but barriers since their last flush. */
++   uint32_t flush_clean_mask = 0;
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+-      struct cs_builder *b = panvk_get_cs_builder(cmdbuf, i);
++      const struct panvk_cs_state *cs_state = &cmdbuf->state.cs[i];
++
++      if (elide && cs_state->flush_valid &&
++          cs_state->builder.ins_count == cs_state->flush_ins_count)
++         flush_clean_mask |= BITFIELD_BIT(i);
++   }
++
++   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
++      /* Not panvk_get_cs_builder(): the compute subqueue's deferred waits
++       * must stay deferred when nothing is emitted on it here. */
++      struct cs_builder *b = &cmdbuf->state.cs[i].builder;
+       struct panvk_cs_state *cs_state = &cmdbuf->state.cs[i];
+ 
+       if (deps.src[i].wait_sb_mask)
+          cs_wait_slots(b, deps.src[i].wait_sb_mask);
+ 
+-      struct panvk_cache_flush_info cache_flush = deps.src[i].cache_flush;
+-      if (!panvk_cache_flush_is_nop(&cache_flush)) {
+-         struct cs_index flush_id = cs_scratch_reg32(b, 0);
+-
+-         panvk_per_arch(panvk_instr_begin_work)(
+-            i, cmdbuf, PANVK_INSTR_WORK_TYPE_FLUSH_CACHE);
+-         cs_move32_to(b, flush_id, 0);
+-         cs_flush_caches(b, cache_flush.l2, cache_flush.lsc, cache_flush.others,
+-                         flush_id, cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
+-         cs_wait_slot(b, SB_ID(IMM_FLUSH));
+-         struct panvk_instr_end_args instr_info_flush = {
+-            .flush_cache = {
+-               .l2 = cache_flush.l2,
+-               .lsc = cache_flush.lsc,
+-               .other = cache_flush.others,
+-            }};
+-         panvk_per_arch(panvk_instr_end_work)(
+-            i, cmdbuf, PANVK_INSTR_WORK_TYPE_FLUSH_CACHE, &instr_info_flush);
++      /* Flushes are placed before the barrier's waits on other subqueues,
++       * so one with nothing but barrier syncs since already does the job. */
++      struct panvk_cache_flush_info *flush = &deps.src[i].cache_flush;
++      if (!panvk_cache_flush_is_nop(flush)) {
++         if ((flush_clean_mask & BITFIELD_BIT(i)) &&
++             cache_flush_covers(&cs_state->last_flush, flush)) {
++            memset(flush, 0, sizeof(*flush));
++         } else {
++            emit_cache_flush(b, cmdbuf, i, flush);
++            cs_state->last_flush = *flush;
++            flush_clean_mask |= BITFIELD_BIT(i);
++         }
+       }
+ 
+       /* If no one waits on us, there's no point signaling the sync object. */
+-      if (wait_subqueue_mask & BITFIELD_BIT(i)) {
++      if ((wait_subqueue_mask & BITFIELD_BIT(i)) && !(i == cq && cq_skip)) {
+          struct cs_index sync_addr = cs_scratch_reg64(b, 0);
+          struct cs_index add_val = cs_scratch_reg64(b, 2);
+ 
+@@ -798,25 +998,80 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+       }
+    }
+ 
+-   if (lazy_vt) {
++   const bool cq_signaled = !cq_skip && (wait_subqueue_mask & BITFIELD_BIT(cq));
++   const uint32_t cq_wait_mask = deps.dst[cq].wait_subqueue_mask;
++
++   /* Idle from here on: defer its waits. */
++   if (cq_defer && (cq_idle || cq_signaled) && cq_wait_mask) {
++      u_foreach_bit(j, cq_wait_mask) {
++         cq_state->lazy_wait_points[j] =
++            MAX2(cq_state->lazy_wait_points[j],
++                 cmdbuf->state.cs[j].relative_sync_point + 1);
++      }
++      cq_state->lazy_waits = true;
++      deps.dst[cq].wait_subqueue_mask = 0;
++   }
++
++   if (lazy_vt || vt_lazy_inherited) {
+       struct panvk_cs_state *vt = &cmdbuf->state.cs[PANVK_SUBQUEUE_VERTEX_TILER];
+-      vt->lazy_frag_wait = true;
++      const int32_t point =
++         lazy_vt ? cmdbuf->state.cs[PANVK_SUBQUEUE_FRAGMENT].relative_sync_point
++                 : vt_lazy_inherited - 1;
++
+       vt->lazy_frag_sync_point =
+-         cmdbuf->state.cs[PANVK_SUBQUEUE_FRAGMENT].relative_sync_point;
++         vt->lazy_frag_wait ? MAX2(vt->lazy_frag_sync_point, point) : point;
++      vt->lazy_frag_wait = true;
+    }
+ 
+    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+-      struct cs_builder *b = panvk_get_cs_builder(cmdbuf, i);
++      struct cs_builder *b = &cmdbuf->state.cs[i].builder;
+       struct cs_index tmp_regs = cs_scratch_reg_tuple(b, 0, 4);
++      int32_t inherited[PANVK_SUBQUEUE_COUNT];
++      const int32_t *inherited_waits = NULL;
++
++      if (cq_skip && (deps.dst[i].wait_subqueue_mask & BITFIELD_BIT(cq))) {
++         memcpy(inherited, cq_waits, sizeof(inherited));
++         if (i == PANVK_SUBQUEUE_VERTEX_TILER && vt_lazy_inherited)
++            inherited[PANVK_SUBQUEUE_FRAGMENT] = 0;
++         inherited_waits = inherited;
++      }
+ 
+       if (deps.dst[i].conditional) {
+          assert(deps.dst[i].cond_value.reg >= tmp_regs.reg + tmp_regs.size ||
+                 deps.dst[i].cond_value.reg + deps.dst[i].cond_value.size <=
+                    tmp_regs.reg);
+          cs_if(b, deps.dst[i].cond, deps.dst[i].cond_value)
+-            emit_barrier_insert_waits(b, cmdbuf, &deps, i, tmp_regs);
++            emit_barrier_insert_waits(b, cmdbuf, &deps, i, inherited_waits,
++                                      tmp_regs);
+       } else {
+-         emit_barrier_insert_waits(b, cmdbuf, &deps, i, tmp_regs);
++         emit_barrier_insert_waits(b, cmdbuf, &deps, i, inherited_waits,
++                                   tmp_regs);
++      }
++   }
++
++   if (elide) {
++      for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
++         struct panvk_cs_state *cs_state = &cmdbuf->state.cs[i];
++
++         cs_state->flush_valid = flush_clean_mask & BITFIELD_BIT(i);
++         cs_state->flush_ins_count = cs_state->builder.ins_count;
++      }
++
++      if (cq_signaled) {
++         cq_state->idle = true;
++         memset(cq_state->idle_waits, 0, sizeof(cq_state->idle_waits));
++      } else if (!cq_idle) {
++         /* Did other work since its last signal, or never signaled. */
++         cq_state->idle = false;
++      }
++
++      if (cq_state->idle) {
++         u_foreach_bit(j, cq_wait_mask) {
++            cq_state->idle_waits[j] =
++               MAX2(cq_state->idle_waits[j],
++                    cmdbuf->state.cs[j].relative_sync_point + 1);
++         }
++         cq_state->idle_ins_count = cq_b->ins_count;
+       }
+    }
+ 
+@@ -890,17 +1145,10 @@ panvk_per_arch(cmd_flush_lazy_vt_wait)(struct panvk_cmd_buffer *cmdbuf)
+ 
+    struct cs_builder *b =
+       panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+-   struct cs_index sync_addr = cs_scratch_reg64(b, 0);
+-   struct cs_index wait_val = cs_scratch_reg64(b, 2);
+ 
+-   cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
+-                offsetof(struct panvk_cs_subqueue_context, syncobjs));
+-   cs_add_imm64(b, sync_addr, sync_addr,
+-                sizeof(struct panvk_cs_sync64) * PANVK_SUBQUEUE_FRAGMENT);
+-   cs_add_imm64(b, wait_val, cs_progress_seqno_reg(b, PANVK_SUBQUEUE_FRAGMENT),
+-                vt->lazy_frag_sync_point);
+-   panvk_instr_sync64_wait(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, false,
+-                           MALI_CS_CONDITION_GREATER, wait_val, sync_addr);
++   emit_subqueue_wait(b, cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER,
++                      PANVK_SUBQUEUE_FRAGMENT, vt->lazy_frag_sync_point,
++                      cs_scratch_reg_tuple(b, 0, 4));
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -911,6 +1159,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+    struct panvk_cs_deps deps = {0};
+ 
+    panvk_per_arch(add_cs_deps)(cmdbuf, pDependencyInfo, &deps, false);
++   deps.may_defer_compute = true;
+ 
+    if (deps.needs_fb_barrier)
+       panvk_per_arch(cmd_fb_barrier)(cmdbuf);
+@@ -1245,6 +1494,28 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
+       panvk_per_arch(panvk_instr_begin_work)(i, cmdbuf,
+                                              PANVK_INSTR_WORK_TYPE_CMDBUF);
+ 
++   /* An earlier primary may have ended without the compute subqueue's
++    * deferred waits (EndCommandBuffer). Until it is used, the compute
++    * subqueue is idle and owes waits on all earlier vertex/tiler and
++    * fragment work (relative sync point 0): it emits them before its first
++    * work, and whoever waits on it while it is idle inherits them.
++    */
++   if (sync_elision_enabled(cmdbuf)) {
++      struct panvk_cs_state *cq_state =
++         &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE];
++
++      cq_state->idle = true;
++      cq_state->idle_ins_count = cq_state->builder.ins_count;
++      memset(cq_state->idle_waits, 0, sizeof(cq_state->idle_waits));
++      memset(cq_state->lazy_wait_points, 0,
++             sizeof(cq_state->lazy_wait_points));
++      cq_state->idle_waits[PANVK_SUBQUEUE_VERTEX_TILER] = 1;
++      cq_state->idle_waits[PANVK_SUBQUEUE_FRAGMENT] = 1;
++      cq_state->lazy_wait_points[PANVK_SUBQUEUE_VERTEX_TILER] = 1;
++      cq_state->lazy_wait_points[PANVK_SUBQUEUE_FRAGMENT] = 1;
++      cq_state->lazy_waits = true;
++   }
++
+    return VK_SUCCESS;
+ }
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 1feed6c6..43408436 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -3166,8 +3166,6 @@ static void
+ update_prims_generated_query(struct panvk_cmd_buffer *cmdbuf,
+                              const struct panvk_draw_info *draw)
+ {
+-   struct cs_builder *b =
+-      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+    struct vk_input_assembly_state *ia = &cmdbuf->vk.dynamic_graphics_state.ia;
+    struct panvk_prims_generated_query_state *state =
+       &cmdbuf->state.gfx.prims_generated_query;
+@@ -3179,6 +3177,10 @@ update_prims_generated_query(struct panvk_cmd_buffer *cmdbuf,
+    if (draw->gpu_prerast_generated && cmdbuf->state.gfx.gs.shader)
+       return;
+ 
++   /* Only now: getting the compute builder emits its deferred waits. */
++   struct cs_builder *b =
++      panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
++
+    uint32_t view_count = cmdbuf->state.gfx.render.view_mask ?
+       util_bitcount(cmdbuf->state.gfx.render.view_mask) : 1;
+ 
+-- 
+2.55.0
+

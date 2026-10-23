@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 16:16:02 -0400
+Subject: [PATCH] panvk/csf: don't truncate the provoking-vertex function
+ address
+
+When the provoking vertex mode isn't known at the start of a render pass,
+the fragment stream calls fn_set_fbds_provoking_vertex, but its GPU
+address was kept in a uint32_t. On kbase, BOs live above 4 GiB (e.g.
+0x5ffffee400), so the stream called 0xfffee400 and faulted with
+CS_BUS_FAULT. Zink hits this path: DOOM 3 BFG (OpenGL) faulted on every
+launch. Mesa main already uses uint64_t here.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit 5d2a6b550a947db5f7f30813191acc4eb3158bc4)
+
+Purpose: keep the GPU address of fn_set_fbds_provoking_vertex 64-bit; truncated to 32 bits, render passes that start before the provoking vertex mode is known called an unmapped address on kbase (CS_BUS_FAULT), e.g. every DOOM 3 BFG launch through Zink
+Upstream-commit: 4ecc4966 ("panvk: Don't downcast CS func address to a 32-bit VA", Mesa main 2026-09-24; not in the pinned base 5a07217)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none
+Validation test: DOOM 3 BFG (OpenGL via Zink in GameNative) faulted on fragment job 10 of every launch (CS_FATAL CS_BUS_FAULT, info 0xbf9a010; decoded fragment stream: MOVE48 d68, #0xFFFEE400 / CALL d68) on our builds and on zenithblue's unmodified RC2; with the fix no fault in 300 s; racetest all cases 0/100 stale, controls 100/100; drawbench image checksums identical (8 tests)
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 712b1b58..4242c4ee 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -2238,7 +2238,7 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+          uint32_t fn_idx = calc_fn_set_fbds_provoking_vertex_idx(cmdbuf);
+          uint32_t fn_stride =
+             dev->draw_ctx->fn_set_fbds_provoking_vertex_stride;
+-         uint32_t fn_addr =
++         uint64_t fn_addr =
+             dev->draw_ctx->fns_bo->addr.dev + fn_idx * fn_stride;
+          cs_move64_to(b, addr_reg, fn_addr);
+          cs_move32_to(b, length_reg, fn_stride);
+-- 
+2.55.0
+

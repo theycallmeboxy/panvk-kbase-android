@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 22:24:05 -0400
+Subject: [PATCH] panvk/csf: drop the per-fragment-job signal with sync elision
+
+Each fragment job ended with a deferred SYNC_ADD64 on the fragment
+subqueue's sync object. Waits on the fragment subqueue target barrier
+signals (or owed sync points), which come after waiting for its earlier
+jobs, so these signals only numbered sync points nothing waits for, at
+~2 us of command stream frontend time per render pass. All subqueues
+share that time, so it was paid on every pass.
+
+With sync elision, don't emit them, nor load the sync object address
+they use. To keep sync point 0 of the next command buffer covering all
+earlier fragment work, the end of the command buffer (and
+vkCmdExecuteCommands()) emits one signal deferred until the fragment
+iterators are idle when jobs ran unsignaled. Secondary command buffers
+keep the per-job signal.
+
+The sync elision check moves to panvk_cmd_buffer.h so the draw code can
+use it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+(cherry picked from commit 8692f2560786aec204bfc8920620d5b8cbd7b386)
+
+Purpose: drop the deferred sync object signal after each fragment job in primary command buffers (nothing waits on those sync points); one deferred signal at the end of the command buffer keeps sync point 0 covering all fragment work
+Upstream-commit: none (generic PanVK CSF; upstream candidate)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/010
+Validation test: drawbench pass tests 7-15% faster (loadpasses, indep, passes, mixclear), draws unchanged, image checksums unchanged; Hades Vulkan renderer 1255 MHz 173.1 -> 177.9 fps (A-B-B-A); Hades DXVK 103.3 -> 104.2 fps at 502 MHz; Serious Sam D3D11 46.8 -> 48.2, Vulkan 53.2 -> 52.9 fps; racetest all cases 0/100 stale, controls 100/100; PanProbe 38/38; no GPU faults
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h    | 17 +++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 65 +++++++++++--------
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   | 27 ++++++--
+ 3 files changed, 74 insertions(+), 35 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index 783d4013..f3f9a20a 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -512,6 +512,10 @@ struct panvk_cs_state {
+     */
+    int32_t owed_sync_point;
+ 
++   /* Fragment only: jobs ran without their own signal since the sync points
++    * were last flushed (see issue_fragment_jobs()). */
++   bool unsignaled_jobs;
++
+    /* Compute only: true while the subqueue has done nothing since its last
+     * barrier signal but wait on other subqueues (idle_ins_count is the
+     * instruction count after those waits). Such a subqueue skips its
+@@ -786,6 +790,19 @@ inherits_render_ctx(struct panvk_cmd_buffer *cmdbuf)
+ 
+ void panvk_per_arch(cmd_flush_lazy_compute)(struct panvk_cmd_buffer *cmdbuf);
+ 
++/* Barrier sync elision, primary command buffers only (see emit_barrier_csf()).
++ * PANVK_NO_SYNC_ELISION=1 turns it off. */
++static inline bool
++panvk_cmd_sync_elision_enabled(const struct panvk_cmd_buffer *cmdbuf)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_SYNC_ELISION", false);
++
++   return !disabled && cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++}
++
+ static inline struct cs_builder *
+ panvk_get_cs_builder(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
+ {
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index 1a42ebef..2442e5b2 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -146,18 +146,6 @@ emit_tls(struct panvk_cmd_buffer *cmdbuf)
+    }
+ }
+ 
+-/* Barrier sync elision (emit_barrier_csf()), primary command buffers only. */
+-static bool
+-sync_elision_enabled(const struct panvk_cmd_buffer *cmdbuf)
+-{
+-   static int disabled = -1;
+-
+-   if (disabled < 0)
+-      disabled = debug_get_bool_option("PANVK_NO_SYNC_ELISION", false);
+-
+-   return !disabled && cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+-}
+-
+ /* The sync point a wait on subqueue j's work so far must target. */
+ static int32_t
+ target_sync_point(const struct panvk_cmd_buffer *cmdbuf,
+@@ -167,29 +155,37 @@ target_sync_point(const struct panvk_cmd_buffer *cmdbuf,
+                cmdbuf->state.cs[j].owed_sync_point);
+ }
+ 
++/* Signal subqueue j's sync object, the next relative sync point. */
+ static void
+-emit_owed_signal(struct panvk_cmd_buffer *cmdbuf, enum panvk_subqueue_id j)
++emit_sync_point_signal(struct panvk_cmd_buffer *cmdbuf,
++                       enum panvk_subqueue_id j, struct cs_async_op async)
+ {
+-   struct panvk_cs_state *cs_state = &cmdbuf->state.cs[j];
+-
+-   if (cs_state->owed_sync_point <= cs_state->relative_sync_point)
+-      return;
+-
+    /* Not panvk_get_cs_builder(): this is a signal, not compute work. */
+-   struct cs_builder *b = &cs_state->builder;
++   struct cs_builder *b = &cmdbuf->state.cs[j].builder;
+    struct cs_index sync_addr = cs_scratch_reg64(b, 0);
+    struct cs_index add_val = cs_scratch_reg64(b, 2);
+ 
+-   assert(!cs_cur_block(b));
+-   assert(cs_state->owed_sync_point == cs_state->relative_sync_point + 1);
+-
+    cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
+                 offsetof(struct panvk_cs_subqueue_context, syncobjs));
+    cs_add_imm64(b, sync_addr, sync_addr, sizeof(struct panvk_cs_sync64) * j);
+    cs_move64_to(b, add_val, 1);
+    panvk_instr_sync64_add(cmdbuf, j, true, MALI_CS_SYNC_SCOPE_CSG, add_val,
+-                          sync_addr, cs_now());
+-   ++cs_state->relative_sync_point;
++                          sync_addr, async);
++   ++cmdbuf->state.cs[j].relative_sync_point;
++}
++
++static void
++emit_owed_signal(struct panvk_cmd_buffer *cmdbuf, enum panvk_subqueue_id j)
++{
++   struct panvk_cs_state *cs_state = &cmdbuf->state.cs[j];
++
++   if (cs_state->owed_sync_point <= cs_state->relative_sync_point)
++      return;
++
++   assert(!cs_cur_block(&cs_state->builder));
++   assert(cs_state->owed_sync_point == cs_state->relative_sync_point + 1);
++
++   emit_sync_point_signal(cmdbuf, j, cs_now());
+ }
+ 
+ static void
+@@ -226,6 +222,19 @@ flush_sync_points(struct panvk_cmd_buffer *cmdbuf)
+    for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++)
+       emit_owed_signal(cmdbuf, j);
+ 
++   /* Keep "all earlier work" (sync point 0 of the next command buffer)
++    * covering fragment jobs that didn't signal: one signal deferred until
++    * they are done. */
++   struct panvk_cs_state *frag = &cmdbuf->state.cs[PANVK_SUBQUEUE_FRAGMENT];
++   if (frag->unsignaled_jobs) {
++      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
++
++      emit_sync_point_signal(cmdbuf, PANVK_SUBQUEUE_FRAGMENT,
++                             cs_defer(dev->csf.sb.all_iters_mask,
++                                      SB_ID(DEFERRED_SYNC)));
++      frag->unsignaled_jobs = false;
++   }
++
+    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
+       struct cs_builder *b = panvk_get_cs_builder(cmdbuf, i);
+ 
+@@ -420,7 +429,7 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+     * deferred cache flush can't be assumed, so emit it: barriers flush
+     * before their waits anyway.
+     */
+-   if (sync_elision_enabled(cmdbuf)) {
++   if (panvk_cmd_sync_elision_enabled(cmdbuf)) {
+       struct panvk_cs_state *cq_state =
+          &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE];
+ 
+@@ -801,7 +810,7 @@ emit_subqueue_wait(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
+                    int32_t sync_point, struct cs_index tmp_regs)
+ {
+    struct panvk_cs_state *cs_state = &cmdbuf->state.cs[i];
+-   const bool elide = sync_elision_enabled(cmdbuf);
++   const bool elide = panvk_cmd_sync_elision_enabled(cmdbuf);
+ 
+    assert(tmp_regs.size == 4);
+ 
+@@ -916,7 +925,7 @@ emit_barrier_csf(struct panvk_cmd_buffer *cmdbuf, struct panvk_cs_deps deps)
+    const enum panvk_subqueue_id cq = PANVK_SUBQUEUE_COMPUTE;
+    struct panvk_cs_state *cq_state = &cmdbuf->state.cs[cq];
+    struct cs_builder *cq_b = &cq_state->builder;
+-   const bool elide = sync_elision_enabled(cmdbuf);
++   const bool elide = panvk_cmd_sync_elision_enabled(cmdbuf);
+    bool cq_idle = elide && cq_state->idle &&
+                   cq_b->ins_count == cq_state->idle_ins_count;
+    const bool cq_defer =
+@@ -1560,7 +1569,7 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
+     * fragment work (relative sync point 0): it emits them before its first
+     * work, and whoever waits on it while it is idle inherits them.
+     */
+-   if (sync_elision_enabled(cmdbuf)) {
++   if (panvk_cmd_sync_elision_enabled(cmdbuf)) {
+       struct panvk_cs_state *cq_state =
+          &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE];
+ 
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 43408436..712b1b58 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -7388,6 +7388,14 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
+ 
+    cs_move64_to(b, add_val, 1);
+ 
++   /* Waits on the fragment subqueue target barrier signals, which come
++    * after waiting for its earlier jobs. With sync elision, the end of the
++    * command buffer emits one (see flush_sync_points()), so the signal after
++    * each fragment job only numbers sync points nothing waits for. */
++   const bool signal_frag_end = !panvk_cmd_sync_elision_enabled(cmdbuf);
++   if (!signal_frag_end)
++      cmdbuf->state.cs[PANVK_SUBQUEUE_FRAGMENT].unsignaled_jobs = true;
++
+    if (free_render_descs) {
+       cs_move32_to(b, release_sz, calc_render_descs_size(cmdbuf));
+       cs_load64_to(b, ringbuf_sync_addr, cs_subqueue_ctx_reg(b),
+@@ -7397,10 +7405,12 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
+ 
+    cs_move32_to(b, tiler_count, td_count);
+ 
+-   cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
+-                offsetof(struct panvk_cs_subqueue_context, syncobjs));
+-   cs_add_imm64(b, sync_addr, sync_addr,
+-                PANVK_SUBQUEUE_FRAGMENT * sizeof(struct panvk_cs_sync64));
++   if (signal_frag_end) {
++      cs_load64_to(b, sync_addr, cs_subqueue_ctx_reg(b),
++                   offsetof(struct panvk_cs_subqueue_context, syncobjs));
++      cs_add_imm64(b, sync_addr, sync_addr,
++                   PANVK_SUBQUEUE_FRAGMENT * sizeof(struct panvk_cs_sync64));
++   }
+ 
+    cs_iter_sb_update(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, sb_update_scratch_regs,
+                      sb_upd_ctx) {
+@@ -7491,8 +7501,10 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
+          }
+       }
+ 
+-      panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, true,
+-                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr, async);
++      if (signal_frag_end)
++         panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, true,
++                                MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
++                                async);
+    }
+ 
+    /* Update the ring buffer position. */
+@@ -7502,7 +7514,8 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
+    }
+ 
+    /* Update the frag seqno. */
+-   ++cmdbuf->state.cs[PANVK_SUBQUEUE_FRAGMENT].relative_sync_point;
++   if (signal_frag_end)
++      ++cmdbuf->state.cs[PANVK_SUBQUEUE_FRAGMENT].relative_sync_point;
+ 
+ 
+    return VK_SUCCESS;
+-- 
+2.55.0
+
