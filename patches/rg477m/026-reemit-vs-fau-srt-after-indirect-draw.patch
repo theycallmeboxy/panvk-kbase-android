@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:10:35 -0400
+Subject: [PATCH] panvk/csf: re-emit the VS FAU and SRT registers after an
+ indirect draw
+
+launch_indirect_draw() runs one RUN_IDVS per indirect draw in a CS loop.
+When the VS reads first_vertex or base_instance, each iteration patches them
+into its own copy of the VS push uniforms and then adds one copy's size to
+VERTEX_FAU; with repeated vertex descriptors it does the same to VERTEX_SRT.
+After the loop both registers point one copy past the end, and the copies
+hold the GPU-patched values of the indirect draws.
+
+The next draw rewrote them only if its own dirty state said so. A direct
+draw that follows with the same first vertex and base instance (so no
+sysval changed) and no vertex input change read its push uniforms and, with
+repeated descriptors, its resource table from past the end of those
+allocations. Nothing hid it except an unrelated rebuild: until now a
+rebuilt FS driver set flagged DESC_STATE, which rewrote VERTEX_SRT too.
+
+Flag VS_PUSH_UNIFORMS after every indirect draw, and VB after one with
+repeated descriptors, so the next draw uploads fresh push uniforms and
+rebuilds the VS tables, writing both registers. This only adds work after
+indirect draws. Found while removing that DESC_STATE side effect (next
+commit); upstream Mesa has the same loop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: fix B14: after an indirect draw the CS loop leaves VERTEX_FAU (and VERTEX_SRT with repeated descriptors) one copy past the end, so a following direct draw with nothing dirty read push uniforms past the allocation; flag VS_PUSH_UNIFORMS (and VB) after indirect draws so the next draw rewrites them. Upstream Mesa has the same loop; only adds work after indirect draws, no switch
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none (fix of upstream code); required by rg477m/027, which removes the FS rebuild that used to rewrite VERTEX_SRT by accident; applies on the full g615-v11-csf series after rg477m/025
+Validation test: part of the device-tested draw-path batch rg477m/023-027: PanProbe 38/38 x2; Arkham Asylum (CPU-bound DXVK, quietd Stock, 10 interleaved rounds + 3) gameplay fps unchanged (median 36.4 base vs 36.55), launch failures 0/13 base vs 2/13 (known B5 signatures, Fisher p~0.48, n.s.); not tested on its own (dEQP draw.*indirect* / shader_draw_parameters not run); no game known to mix indirect and direct draws (vkd3d-proton) checked separately; combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 7922dbe0..8aebbb5a 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -5970,10 +5970,22 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info draw)
+    if (!draw.prims_generated_counted)
+       update_prims_generated_query(cmdbuf, &draw);
+ 
+-   if (draw.indirect.buffer_dev_addr)
++   if (draw.indirect.buffer_dev_addr) {
+       launch_indirect_draw(cmdbuf, &draw);
+-   else
++
++      /* The draw loop advanced VERTEX_FAU (when it patched first_vertex or
++       * base_instance into the FAU copies) and VERTEX_SRT (with repeated
++       * descriptors) once per draw, so they now point past the last copy,
++       * and the copies hold the GPU-patched values of the indirect draws.
++       * Make the next draw upload fresh push uniforms and rebuild the VS
++       * tables, which rewrites both registers.
++       */
++      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
++      if (cmdbuf->state.gfx.vs.desc_repeat_count)
++         gfx_state_set_dirty(cmdbuf, VB);
++   } else {
+       launch_draw(cmdbuf, &draw);
++   }
+ }
+ 
+ VkResult
+-- 
+2.55.0
+
