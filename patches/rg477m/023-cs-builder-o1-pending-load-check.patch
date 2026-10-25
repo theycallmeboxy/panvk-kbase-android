@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:52:56 -0400
+Subject: [PATCH] panfrost/cs: O(1) pending-load check and an inline fast path
+ for CS allocation
+
+Every CS instruction goes through cs_alloc_ins_block() and, once per
+register operand, cs_flush_load_to(). In a CPU profile of Batman: Arkham
+Asylum's DXVK submission thread they were 5.05% and 3.14% of PanVK's
+samples (cs_move32_to, which is little more than both, another 3.73%),
+and neither was inlined.
+
+cs_flush_load_to() walked up to 16 registers testing each bit of the
+256-bit pending-load bitset, which is nearly always empty while recording
+draws. The registers of an operand lie in at most two consecutive words of
+the bitset, so shift those two words into a 64-bit value and test it
+against the mask in one AND.
+
+cs_alloc_ins_block() called cs_reserve_instrs() for every instruction,
+which re-checks validity, the allocation mode, the lazy root chunk and the
+chunk capacity. Take the common case inline: no open block, a valid
+growable CS with a live chunk that still has room for the instructions
+plus the chunk-linking sequence. That is exactly the case in which
+cs_reserve_instrs() returns true without doing anything; everything else
+goes to the unchanged out-of-line path.
+
+The emitted command streams are bit-identical: a host-side differential
+test builds the old and the new header into one binary and replays 20000
+random instruction sequences through both (moves, 1-16 register loads and
+stores at every base register, waits, if/else, loops with break/continue,
+match, maybe, LOAD_IP, chunk overflow with 64-2000 instruction chunks,
+fixed buffers, allocation failure, dirty tracking): 68M instructions, all
+bytes, sizes and dirty sets equal. A one-line mutation of the bitset
+extraction is caught on the first sequence. Host timing of a 14-instruction
+draw-like sequence (Apple M-series, -O2): 49-55 ns -> 26 ns.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: D1: CPU per draw: cs_flush_load_to() checks pending loads with one 64-bit test instead of looping the 256-bit bitset per operand (ALWAYS_INLINE), and cs_alloc_ins_block() gets an inline fast path with the chunk-linking slow path out of line (.text -0.94 MB); command stream bit-identical, no switch
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none; applies on the full g615-v11-csf series after rg477m/022
+Validation test: host csdiff: 20,000 random CS sequences (68,069,136 instructions, chunk linking, alloc failures) byte-identical old vs new, mutation check fails on sequence 0; host timing 49-55 -> 26 ns per 14-instruction draw sequence; draw-path batch rg477m/023-027 on the device (drawcpu bench, DXVK pattern, 20,000 draws x 20 reps, pinned A715 at max clock, 10 interleaved runs per build): 543.6 -> 467.9 ns per recorded draw (-14%), with rg477m/024-027 switched off 501.8 (this patch about -8%); PanProbe 38/38 x2; Arkham Asylum (CPU-bound DXVK, quietd Stock, 10 interleaved rounds + 3) gameplay fps unchanged (median 36.4 base vs 36.55), launch failures 0/13 base vs 2/13 (known B5 signatures, Fisher p~0.48, n.s.); combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/genxml/cs_builder.h | 57 ++++++++++++++++++++++++--------
+ 1 file changed, 43 insertions(+), 14 deletions(-)
+
+diff --git a/src/panfrost/genxml/cs_builder.h b/src/panfrost/genxml/cs_builder.h
+index cfd839c3..ecb3bfc5 100644
+--- a/src/panfrost/genxml/cs_builder.h
++++ b/src/panfrost/genxml/cs_builder.h
+@@ -608,11 +608,9 @@ cs_reserve_instrs(struct cs_builder *b, uint32_t num_instrs)
+    return true;
+ }
+ 
+-static inline void *
+-cs_alloc_ins_block(struct cs_builder *b, uint32_t num_instrs)
++static ATTRIBUTE_NOINLINE UNUSED void *
++cs_alloc_ins_block_slow(struct cs_builder *b, uint32_t num_instrs)
+ {
+-   b->ins_count += num_instrs;
+-
+    if (cs_cur_block(b))
+       return util_dynarray_grow(&b->blocks.instrs, uint64_t, num_instrs);
+ 
+@@ -625,6 +623,29 @@ cs_alloc_ins_block(struct cs_builder *b, uint32_t num_instrs)
+    return b->cur_chunk.buffer.cpu + pos;
+ }
+ 
++static ALWAYS_INLINE void *
++cs_alloc_ins_block(struct cs_builder *b, uint32_t num_instrs)
++{
++   b->ins_count += num_instrs;
++
++   /* Fast path, taken by nearly every instruction: no block is open and the
++    * current chunk of a growable CS still has room for the instructions plus
++    * a chunk-linking sequence. cs_reserve_instrs() would return true without
++    * doing anything in that case, so skip it.
++    */
++   uint32_t pos = b->cur_chunk.pos;
++   if (likely(cs_cur_block(b) == NULL && cs_is_valid(b) &&
++              b->conf.alloc_buffer != NULL && b->cur_chunk.buffer.cpu != NULL &&
++              pos + num_instrs + JUMP_SEQ_INSTR_COUNT <=
++                 b->cur_chunk.buffer.capacity)) {
++      assert(num_instrs > 0);
++      b->cur_chunk.pos = pos + num_instrs;
++      return b->cur_chunk.buffer.cpu + pos;
++   }
++
++   return cs_alloc_ins_block_slow(b, num_instrs);
++}
++
+ static inline void
+ cs_flush_block_instrs(struct cs_builder *b)
+ {
+@@ -964,22 +985,30 @@ cs_wait_slot(struct cs_builder *b, unsigned slot)
+    cs_wait_slots(b, BITFIELD_BIT(slot));
+ }
+ 
+-static inline void
++static ALWAYS_INLINE void
+ cs_flush_load_to(struct cs_builder *b, struct cs_index to, uint16_t mask)
+ {
+    struct cs_load_store_tracker *ls_tracker = b->cur_ls_tracker;
+    assert(ls_tracker != NULL);
+ 
+-   unsigned count = util_last_bit(mask);
+-   unsigned reg = cs_to_reg_tuple(to, count);
++   unsigned reg = cs_to_reg_tuple(to, util_last_bit(mask));
+ 
+-   for (unsigned i = reg; i < reg + count; i++) {
+-      if ((mask & BITFIELD_BIT(i - reg)) &&
+-          BITSET_TEST(ls_tracker->pending_loads, i)) {
+-         cs_wait_slots(b, BITFIELD_BIT(b->conf.ls_sb_slot));
+-         break;
+-      }
+-   }
++   /* This runs for every register operand of every instruction, so test the
++    * at most 16 registers of the mask in one go instead of bit by bit: the
++    * bits [reg, reg + 16) of the pending-load bitset lie in at most two
++    * consecutive words.
++    */
++   const unsigned nr_words = ARRAY_SIZE(ls_tracker->pending_loads);
++   const unsigned word = reg / BITSET_WORDBITS;
++   const unsigned shift = reg % BITSET_WORDBITS;
++   assert(word < nr_words);
++
++   uint64_t pending = ls_tracker->pending_loads[word];
++   if (word + 1 < nr_words)
++      pending |= (uint64_t)ls_tracker->pending_loads[word + 1] << BITSET_WORDBITS;
++
++   if (unlikely((pending >> shift) & mask))
++      cs_wait_slots(b, BITFIELD_BIT(b->conf.ls_sb_slot));
+ }
+ 
+ static inline void
+-- 
+2.55.0
+
