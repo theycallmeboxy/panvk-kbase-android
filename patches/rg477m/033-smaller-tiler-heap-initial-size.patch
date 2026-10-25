@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: abhay-byte <zenithblue.dev@gmail.com>
+Date: Sat, 24 Oct 2026 00:25:17 +0000
+Subject: [PATCH] panvk/kbase: smaller tiler heap initial size (csf-v11 224, no
+ TERM backlog part)
+
+Rationale: with chunk recycling disarmed on kbase (csf-v11 098), a tiler
+heap is renewed after about every big submit (KBASE_TILER_HEAP_RENEW_WORK),
+and every new heap commits and zeroes 10 initial 1 MiB chunks. Up to
+PANVK_KBASE_HEAP_SLOTS heaps, a spare and up to 16 retired heaps waiting
+for TERM on the heap thread are alive at once, and a retired heap keeps
+every chunk it grew until its TERM (fo4-memory-analysis section 2.2).
+
+- PANVK_KBASE_HEAP_CHUNKS=<initial>[,<max>]: default 4 initial chunks and
+  the physical-device max (400); "10,400" is the old behaviour. The heap
+  grows on demand through kbase tiler OOM, so only a few more growth
+  events per heap.
+- PANVK_KBASE_HEAP_TERM_MAX (default 2, old 16, 0 = all synchronous): at
+  most that many retired heaps wait for TERM on the heap thread; beyond
+  it, TERM runs on the submitting thread, so the chunks go back sooner.
+- One info line at the first heap: "kbase: tiler heaps N initial / M max
+  chunks of K KiB".
+
+Expected gain: 6 MiB per heap generation (about 30-60 MiB with 5-10 heaps
+alive) and up to 14 fewer grown retired heaps pending under GPU-bound
+load. The max is unchanged (lowering it sends big frames through the
+incremental-render OOM path). Arch: v10+ kbase only.
+
+Port of zenithblue csf-v11/224 onto the RC3-lowmem + rg477m base
+(memport): only the PANVK_KBASE_HEAP_CHUNKS part. This base has no heap
+TERM thread (no PANVK_KBASE_HEAP_TERM_MAX), so the bounded-backlog half is
+dropped. With rg477m/007 (firmware chunk recycling, the default) heaps are
+not renewed, so here the change applies to the live heap of each queue and
+its pre-created spare: 6 MiB less committed per heap at queue creation
+when the scene needs fewer than 10 chunks. PANVK_KBASE_NO_HEAP_OPS=1 brings
+back renewal, and then every renewed heap also starts at 4 chunks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Purpose: M3 (224, heap-size part): kbase tiler heaps start with 4 chunks instead of 10 (max unchanged at 400 x 1 MiB), up to 6 MiB less committed per heap at queue creation for scenes needing fewer than 10 chunks; heavier scenes grow through kbase tiler OOM in the first frames. PANVK_KBASE_HEAP_CHUNKS=<initial>[,<max>] (10 = old). The TERM-backlog part is dropped (no TERM thread in this base)
+Upstream-commit: zenithblue csf-v11/224 (port)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/032 (kbase_heap_create_counted()); applies on the full g615-v11-csf series after rg477m/032
+Validation test: built OK at this commit on memport (bld.sh, 0 new warnings) and at next tip 7390330e in compat and unsafe; combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks; the tiler-heap overflow path can't be tested on this kernel (B15), max unchanged
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c | 61 +++++++++++++++++---
+ 1 file changed, 53 insertions(+), 8 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index b17557ee..f92c1aa7 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -21,6 +21,7 @@
+ #include "pan_trace.h"
+ 
+ #include "util/bitscan.h"
++#include "util/os_misc.h"
+ #include "util/os_time.h"
+ #include "vk_drm_syncobj.h"
+ #include "vk_log.h"
+@@ -2113,6 +2114,46 @@ kbase_heap_destroy_counted(struct pan_kmod_dev *kdev, uint64_t heap_ctx_va)
+    p_atomic_dec(&panvk_mem_stats.heap_ctx_live);
+ }
+ 
++/* csf-v11 224: kbase tiler heap sizes. Every renewal (about every submit in
++ * big games, KBASE_TILER_HEAP_RENEW_WORK) creates a heap that commits and
++ * zeroes its initial chunks, and up to PANVK_KBASE_HEAP_SLOTS heaps plus a
++ * spare plus the TERM backlog are alive at once, so the initial size is
++ * paid 5-20 times. The heap grows on demand (kbase tiler OOM), so fewer
++ * initial chunks only cost a few more growth events per heap.
++ * PANVK_KBASE_HEAP_CHUNKS=<initial>[,<max>]: default 4,<physical max>;
++ * "10,400" is the old behaviour. */
++static void
++kbase_heap_chunks(const struct panvk_physical_device *phys_dev,
++                  uint32_t *initial, uint32_t *max)
++{
++   static uint32_t init_v, max_v;
++
++   if (!p_atomic_read(&max_v)) {
++      uint32_t i = MIN2(phys_dev->csf.tiler.initial_chunks, 4);
++      uint32_t m = MAX2(phys_dev->csf.tiler.max_chunks, 200);
++      const char *e = os_get_option("PANVK_KBASE_HEAP_CHUNKS");
++
++      if (e && e[0]) {
++         char *end;
++         unsigned long v = strtoul(e, &end, 10);
++         if (v >= 1 && v <= 1024)
++            i = v;
++         if (*end == ',') {
++            v = strtoul(end + 1, NULL, 10);
++            if (v >= 8 && v <= 4096)
++               m = v;
++         }
++      }
++      i = MIN2(i, m);
++      p_atomic_set(&init_v, i);
++      p_atomic_set(&max_v, m);
++      mesa_logi("kbase: tiler heaps %u initial / %u max chunks of %u KiB",
++                i, m, phys_dev->csf.tiler.chunk_size / 1024);
++   }
++   *initial = p_atomic_read(&init_v);
++   *max = p_atomic_read(&max_v);
++}
++
+ static void
+ kbase_spare_heap_job(void *job, void *gdata, int thread_index)
+ {
+@@ -2121,11 +2162,13 @@ kbase_spare_heap_job(void *job, void *gdata, int thread_index)
+    const struct panvk_physical_device *phys_dev =
+       to_panvk_physical_device(dev->vk.physical);
+ 
++   uint32_t initial_chunks, max_chunks;
++   kbase_heap_chunks(phys_dev, &initial_chunks, &max_chunks);
++
+    /* On failure ctx stays 0 and the renewal creates the heap itself. */
+    if (kbase_heap_create_counted(
+-          dev->kmod.dev, queue->tiler_heap.chunk_size,
+-          phys_dev->csf.tiler.initial_chunks,
+-          MAX2(phys_dev->csf.tiler.max_chunks, 200), 65535, 0,
++          dev->kmod.dev, queue->tiler_heap.chunk_size, initial_chunks,
++          max_chunks, 65535, 0,
+           &queue->kbase_spare_heap.ctx, &queue->kbase_spare_heap.first_chunk))
+       queue->kbase_spare_heap.ctx = 0;
+ }
+@@ -2235,12 +2278,13 @@ init_tiler(struct panvk_gpu_queue *queue)
+       /* Match the Valhall G610/G710 kbase reference.  The panthor-derived
+        * limit of 64 can strand large geometry workloads on the tiler iterator;
+        * larger multi-GiB limits can trigger Android's global OOM killer. */
+-      const uint32_t tiler_heap_max_chunks =
+-         MAX2(phys_dev->csf.tiler.max_chunks, 200);
++      uint32_t tiler_heap_initial_chunks, tiler_heap_max_chunks;
++      kbase_heap_chunks(phys_dev, &tiler_heap_initial_chunks,
++                        &tiler_heap_max_chunks);
+ 
+       if (kbase_heap_create_counted(
+              dev->kmod.dev, tiler_heap->chunk_size,
+-             phys_dev->csf.tiler.initial_chunks, tiler_heap_max_chunks,
++             tiler_heap_initial_chunks, tiler_heap_max_chunks,
+              65535, tiler_heap_mem_group, &heap_ctx_va, &first_chunk_va)) {
+          result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                                "Failed to create a tiler heap context");
+@@ -2396,7 +2440,8 @@ kbase_renew_tiler_heap(struct panvk_gpu_queue *queue)
+    const struct panvk_physical_device *phys_dev =
+       to_panvk_physical_device(dev->vk.physical);
+    struct panvk_tiler_heap *tiler_heap = &queue->tiler_heap;
+-   const uint32_t max_chunks = MAX2(phys_dev->csf.tiler.max_chunks, 200);
++   uint32_t initial_chunks, max_chunks;
++   kbase_heap_chunks(phys_dev, &initial_chunks, &max_chunks);
+    uint64_t new_ctx, first_chunk;
+ 
+    /* Hold at most PANVK_KBASE_HEAP_SLOTS - 1 retired contexts: if they are
+@@ -2410,7 +2455,7 @@ kbase_renew_tiler_heap(struct panvk_gpu_queue *queue)
+    if (!new_ctx &&
+        kbase_heap_create_counted(
+           dev->kmod.dev, tiler_heap->chunk_size,
+-          phys_dev->csf.tiler.initial_chunks, max_chunks, 65535, 0,
++          initial_chunks, max_chunks, 65535, 0,
+           &new_ctx, &first_chunk)) {
+       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                           "Failed to renew the kbase tiler heap");
+-- 
+2.55.0
+
