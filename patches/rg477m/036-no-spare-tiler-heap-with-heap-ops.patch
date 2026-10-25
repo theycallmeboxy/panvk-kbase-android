@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:42:21 -0400
+Subject: [PATCH] panvk/kbase: don't pre-create a spare tiler heap when the
+ firmware recycles chunks
+
+The spare heap (created on the panvk_heap thread at queue creation) is only
+taken by kbase_renew_tiler_heap(). With rg477m/007 the firmware recycles
+heap chunks and renewal is off (PANVK_KBASE_NO_HEAP_OPS unset, the
+default), so the spare was never used: it held its initial chunks
+(10 x 1 MiB, 4 x 1 MiB with csf-v11 224) and a thread for the life of the
+queue. Now the spare and its thread exist only with
+PANVK_KBASE_NO_HEAP_OPS=1, where renewal uses them as before.
+
+Expected gain: 10 MiB of committed GPU memory per VkQueue (4 MiB on top of
+csf-v11 224) and one thread. rg477m candidate (not upstream): our 007 made
+the spare dead weight.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: M2: kbase_spare_heap_init() creates the spare tiler heap and its panvk_heap thread only with PANVK_KBASE_NO_HEAP_OPS=1: the spare is only taken by heap renewal, which never runs with rg477m/007's firmware chunk recycling on (the default), so every VkQueue held a dead heap (10 MiB, 4 MiB after rg477m/033) and an idle thread. No own switch; PANVK_KBASE_NO_HEAP_OPS=1 brings the spare back but also turns 007 off
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/007 (heap ops make the spare dead weight; fixes our own regression); applies on the full g615-v11-csf series after rg477m/035
+Validation test: built OK at this commit on memport (bld.sh, 0 new warnings) and at next tip 7390330e in compat and unsafe; combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index f92c1aa7..27468260 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -2205,6 +2205,16 @@ static void
+ kbase_spare_heap_init(struct panvk_gpu_queue *queue)
+ {
+    util_queue_fence_init(&queue->kbase_spare_heap.fence);
++
++   /* With firmware chunk recycling (rg477m/007, the default) the heap is
++    * never renewed, so a spare would only hold its initial chunks and a
++    * thread until the queue is destroyed. PANVK_KBASE_NO_HEAP_OPS=1 brings
++    * back renewal and the spare. */
++   if (panvk_kbase_heap_ops()) {
++      queue->kbase_spare_heap.enabled = false;
++      return;
++   }
++
+    queue->kbase_spare_heap.enabled =
+       util_queue_init(&queue->kbase_spare_heap.thread, "panvk_heap", 2, 1, 0,
+                       NULL);
+-- 
+2.55.0
+
