@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:10:49 -0400
+Subject: [PATCH] panvk/csf: don't rebuild the FS descriptor tables after a
+ VS-only change
+
+prepare_vs_driver_set() and prepare_fs_driver_set() flagged DESC_STATE
+after rebuilding a stage's tables, so that prepare_vs()/prepare_fs() would
+write the SRT registers. But DESC_STATE also means "the application's
+descriptor bindings changed", and fs_desc_dirty() reads it: every VS-only
+change (vkCmdBindVertexBuffers, vertex input, strides, a base instance the
+attributes depend on) also re-packed the FS driver set (varying
+attributes, sampler, dynamic buffers) and the FS resource table, which do
+not depend on vertex input, and an FS-only change rewrote VERTEX_SRT. DXVK
+rebinds its vertex buffers on every input-layout or stream change.
+
+New VS_SRT and FS_SRT dirty bits say "this stage's resource table was
+rebuilt, write its register"; the SRT writes test them next to the stage's
+own dirty condition. DESC_STATE keeps its API meaning. Vertex buffer
+changes now rebuild only the VS tables (2 of the 4 descriptor allocations
+and about half the descriptor packs of such a draw).
+
+PANVK_NO_DESC_SPLIT=1 flags DESC_STATE from the driver sets again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: D4 first step: CPU per draw: new VS_SRT/FS_SRT dirty bits replace the driver sets' self-set DESC_STATE, so a VS-only change (vertex buffers, vertex input, base instance) no longer rebuilds the FS driver set and resource table, and an FS-only change no longer rewrites VERTEX_SRT. PANVK_NO_DESC_SPLIT=1 reverts
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/026 (B14 fix; without it this patch exposes the stale VERTEX_SRT after indirect draws); applies on the full g615-v11-csf series after rg477m/026
+Validation test: draw-path batch rg477m/023-027 on the device (drawcpu bench, DXVK pattern, 20,000 draws x 20 reps, pinned A715 at max clock, 10 interleaved runs per build): 543.6 -> 467.9 ns per recorded draw (-14%); with rg477m/024, 025 and 027 switched off 501.8 (the three together about -7%); PanProbe 38/38 x2; Arkham Asylum (CPU-bound DXVK, quietd Stock, 10 interleaved rounds + 3) gameplay fps unchanged (median 36.4 base vs 36.55), launch failures 0/13 base vs 2/13 (known B5 signatures, Fisher p~0.48, n.s.); combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h  | 16 ++++++++++++++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c | 14 ++++++++++----
+ src/panfrost/vulkan/panvk_cmd_draw.h        |  4 ++++
+ 3 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index ece1f33e..36f8c026 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -781,6 +781,22 @@ panvk_idvs_reg_cache_enabled(void)
+    return !disabled;
+ }
+ 
++/* A rebuilt VS driver set or resource table no longer flags DESC_STATE, which
++ * made the next draw rebuild the FS tables after a VS-only change (vertex
++ * buffers, vertex input, base instance); per-stage SRT dirty bits tell
++ * prepare_vs()/prepare_fs() to write the register instead.
++ * PANVK_NO_DESC_SPLIT=1 flags DESC_STATE again. */
++static inline bool
++panvk_desc_split_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_DESC_SPLIT", false);
++
++   return !disabled;
++}
++
+ /* Barrier sync elision, primary command buffers only (see emit_barrier_csf()).
+  * PANVK_NO_SYNC_ELISION=1 turns it off. */
+ static inline bool
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 8aebbb5a..bb4c5959 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -412,7 +412,10 @@ prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf, uint32_t repeat_count)
+ 
+    vs_desc_state->driver_set.dev_addr = driver_set.gpu;
+    vs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+-   gfx_state_set_dirty(cmdbuf, DESC_STATE);
++   if (panvk_desc_split_enabled())
++      gfx_state_set_dirty(cmdbuf, VS_SRT);
++   else
++      gfx_state_set_dirty(cmdbuf, DESC_STATE);
+    return VK_SUCCESS;
+ }
+ 
+@@ -576,7 +579,10 @@ prepare_fs_driver_set(struct panvk_cmd_buffer *cmdbuf)
+ 
+    fs_desc_state->driver_set.dev_addr = driver_set.gpu;
+    fs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+-   gfx_state_set_dirty(cmdbuf, DESC_STATE);
++   if (panvk_desc_split_enabled())
++      gfx_state_set_dirty(cmdbuf, FS_SRT);
++   else
++      gfx_state_set_dirty(cmdbuf, DESC_STATE);
+    return VK_SUCCESS;
+ }
+ 
+@@ -2323,7 +2329,7 @@ prepare_vs(struct panvk_cmd_buffer *cmdbuf,
+       panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+ 
+    cs_update_vt_ctx(b) {
+-      if (vs_desc_dirty(cmdbuf))
++      if (vs_desc_dirty(cmdbuf) || gfx_state_dirty(cmdbuf, VS_SRT))
+          cs_move64_to(b, cs_sr_reg64(b, IDVS, VERTEX_SRT),
+                       vs_desc_state->res_table);
+ 
+@@ -2362,7 +2368,7 @@ prepare_fs(struct panvk_cmd_buffer *cmdbuf,
+       panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+ 
+    cs_update_vt_ctx(b) {
+-      if (fs_desc_dirty(cmdbuf))
++      if (fs_desc_dirty(cmdbuf) || gfx_state_dirty(cmdbuf, FS_SRT))
+          cs_move64_to(b, cs_sr_reg64(b, IDVS, FRAGMENT_SRT),
+                       fs ? fs_desc_state->res_table : 0);
+       if (fs_user_dirty(cmdbuf))
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index b6c44695..d32abf43 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -160,6 +160,10 @@ enum panvk_cmd_graphics_dirty_state {
+    PANVK_CMD_GRAPHICS_DIRTY_VS_PUSH_UNIFORMS,
+    PANVK_CMD_GRAPHICS_DIRTY_FS_PUSH_UNIFORMS,
+    PANVK_CMD_GRAPHICS_DIRTY_IDVS,
++   /* CSF: the VS/FS resource table was rebuilt, its SRT register needs
++    * writing (prepare_vs_driver_set(), prepare_fs_driver_set()). */
++   PANVK_CMD_GRAPHICS_DIRTY_VS_SRT,
++   PANVK_CMD_GRAPHICS_DIRTY_FS_SRT,
+    PANVK_CMD_GRAPHICS_DIRTY_STATE_COUNT,
+ };
+ 
+-- 
+2.55.0
+
