@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:21:54 -0400
+Subject: [PATCH] panvk/csf: build the incremental-rendering FBD sets only when
+ needed, share their frame shaders
+
+get_fb_descs() builds, next to the pass's FBDs, three spare FBD sets for
+incremental rendering (IR_FIRST/MIDDLE/LAST), which only the tiler OOM
+handler reads. Each IR set ran cmd_get_frame_shaders() again, once per
+layer, and each run re-emits the preload/resolve DCDs: a meta-cache shader
+lookup, blend descriptors, a sampler, a resource table, a ZS descriptor,
+FAUs and one texture descriptor per loaded target. A colour + D24S8 pass
+that loads both built 4 frame-shader sets (8 preload DCDs) and 4 FBD sets;
+a clear-only pass, which tiles nothing and so can't hit a tiler OOM, still
+built all three IR sets.
+
+- With no tiler context (render->tiler == 0, the clear-only path of
+  CmdEndRendering, which ends the pass), the IR sets are skipped and their
+  OOM-context pointers are 0. Every draw allocates the tiler context
+  before the FBDs, so a pass that tiles anything still gets all three.
+- The frame shaders depend only on (fb, load, resolve); the layer and the
+  store don't enter cmd_get_frame_shaders(), and the DCDs are never
+  patched. Without a resolve shader (modes[2] NEVER in the main set) the
+  main set (fb.load, resolve) equals IR_FIRST's (fb.load, NULL), and
+  IR_MIDDLE's (spill.load, NULL) equals IR_LAST's (spill.load, resolve):
+  those reuse the same DCDs. With a resolve, each IR pass builds its own
+  set as before. Either way once per IR pass, not once per layer.
+- The IR FBD bodies (spill/final stores, CRC stripping on v10) are still
+  emitted per IR pass and layer, unchanged.
+
+Per pass, 1 layer, no resolve: load pass 8 -> 4 preload DCDs (4 -> 2
+frame-shader sets), clear + draws 4 -> 2, clear-only 4 -> 0 DCDs and
+4 -> 1 FBD sets. The FBD sets the OOM handler reads hold the same bytes
+apart from DCD addresses whose contents are identical.
+
+PANVK_NO_SPARE_FBD_REUSE=1 builds every IR set from scratch again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: R4: CPU per render pass: the incremental-rendering (tiler-OOM) FBD sets are skipped for clear-only passes, IR_FIRST reuses the main set's frame shaders and IR_LAST IR_MIDDLE's when there is no resolve, and frame shaders are built once per IR pass instead of per layer. PANVK_NO_SPARE_FBD_REUSE=1 reverts
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none; applies on the full g615-v11-csf series after rg477m/027 (same file as rg477m/024-027)
+Validation test: drawcpu bench passes modes on the device: pass recording 4.99 -> 4.18 us/pass (LOAD/CLEAR mix, -16%) and 4.43 -> 3.89 (CLEAR, -12%); PanProbe 38/38 x2 on rpspare.so; ircheck colour and depth checksums identical across rpspare, drawcpu and base builds in all 4 variants, uncapped; the tiler-OOM path can't be exercised on this kernel (B15: the uAPI 1.21 group create has no csi_handlers, so a forced overflow terminates the group on every build); combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c | 88 ++++++++++++++++++---
+ 1 file changed, 77 insertions(+), 11 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index bb4c5959..9730642f 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -1856,6 +1856,21 @@ invalidate_unselected_crc_rts(struct cs_builder *b,
+    }
+ }
+ 
++/* get_fb_descs() builds the incremental-rendering (IR) FBD sets only for
++ * passes that can hit a tiler OOM, and emits each distinct set of frame
++ * shaders (preload/resolve DCDs) once instead of once per IR pass and layer.
++ * PANVK_NO_SPARE_FBD_REUSE=1 builds every IR set from scratch again. */
++static bool
++spare_fbd_reuse_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_SPARE_FBD_REUSE", false);
++
++   return !disabled;
++}
++
+ static VkResult
+ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+ {
+@@ -2000,7 +2015,38 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_FRAGMENT);
+    invalidate_unselected_crc_rts(b, &fbd_info);
+ 
++   /* The IR FBD sets are only read by the tiler OOM handler, which runs while
++    * the tiler of this pass is out of heap memory. With no tiler context
++    * (render->tiler == 0: get_fb_descs() called from CmdEndRendering for a
++    * clear-only pass, which ends the pass), nothing is tiled and that can't
++    * happen, so skip them. Any draw allocates the tiler context first
++    * (get_render_ctx()), so a pass with draws never gets here with
++    * tiler == 0.
++    *
++    * The frame shaders depend only on (fb, load, resolve), not on the layer
++    * or the store: cmd_get_frame_shaders() reads neither, and the DCDs it
++    * emits are never patched afterwards. Without a resolve shader the main
++    * set (fb.load, resolve) equals IR_FIRST's (fb.load, NULL) and IR_MIDDLE's
++    * (spill.load, NULL) equals IR_LAST's (spill.load, resolve): no post-frame
++    * DCD is emitted for either and modes[2] stays NEVER. Reuse them then;
++    * otherwise build each IR pass's own set, once for all its layers. */
++   const bool reuse_spares = spare_fbd_reuse_enabled();
++   const bool build_ir_sets = !reuse_spares || render->tiler != 0;
++   const struct pan_fb_frame_shaders main_frame_shaders =
++      fbd_info.frame_shaders;
++   const bool has_resolve_shader =
++      main_frame_shaders.modes[2] != MALI_PRE_POST_FRAME_SHADER_MODE_NEVER;
++   struct pan_fb_frame_shaders middle_frame_shaders = {0};
++
+    for (uint32_t ir_pass = 0; ir_pass < PANVK_IR_PASS_COUNT; ir_pass++) {
++      static_assert(ARRAY_SIZE(cmdbuf->state.gfx.render.ir.fbds) == PANVK_IR_PASS_COUNT,
++                    "ir.fbds array size must match PANVK_IR_PASS_COUNT");
++
++      if (!build_ir_sets) {
++         cmdbuf->state.gfx.render.ir.fbds[ir_pass] = 0;
++         continue;
++      }
++
+       struct pan_ptr ir_fbds =
+          panvk_cmd_alloc_dev_mem(cmdbuf, desc, fbds_sz, fbds_alignment);
+ 
+@@ -2022,22 +2068,44 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+ 
+       ir_store = &ir_store_without_crc;
+ #endif
++      const struct pan_fb_load *ir_load = ir_pass == PANVK_IR_FIRST_PASS
++                                             ? &render->fb.load
++                                             : &render->fb.spill.load;
++      const struct pan_fb_resolve *ir_resolve =
++         ir_pass == PANVK_IR_LAST_PASS ? &render->fb.resolve : NULL;
++
++      if (reuse_spares) {
++         if (ir_pass == PANVK_IR_FIRST_PASS && !has_resolve_shader) {
++            fbd_info.frame_shaders = main_frame_shaders;
++         } else if (ir_pass == PANVK_IR_LAST_PASS && !has_resolve_shader) {
++            fbd_info.frame_shaders = middle_frame_shaders;
++         } else {
++            VkResult result = panvk_per_arch(cmd_get_frame_shaders)(
++               cmdbuf, fbd_info.fb, ir_load, ir_resolve,
++               &fbd_info.frame_shaders);
++            if (result != VK_SUCCESS)
++               return result;
++         }
++
++         if (ir_pass == PANVK_IR_MIDDLE_PASS)
++            middle_frame_shaders = fbd_info.frame_shaders;
++      }
++
+       for (uint32_t i = 0; i < enabled_layer_count; i++) {
+          uint32_t layer_idx = multiview ? u_bit_scan(&ir_view_mask_temp) : i;
+ 
+          fbd_info.layer = layer_idx;
+          tiler_ctx = get_tiler_context(cmdbuf, layer_idx);
+-         fbd_info.load = ir_pass == PANVK_IR_FIRST_PASS
+-                            ? &render->fb.load
+-                            : &render->fb.spill.load;
++         fbd_info.load = ir_load;
+          fbd_info.store = ir_store;
+ 
+-         VkResult result = panvk_per_arch(cmd_get_frame_shaders)(
+-            cmdbuf, fbd_info.fb, fbd_info.load,
+-            ir_pass == PANVK_IR_LAST_PASS ? &render->fb.resolve : NULL,
+-            &fbd_info.frame_shaders);
+-         if (result != VK_SUCCESS)
+-            return result;
++         if (!reuse_spares) {
++            VkResult result = panvk_per_arch(cmd_get_frame_shaders)(
++               cmdbuf, fbd_info.fb, ir_load, ir_resolve,
++               &fbd_info.frame_shaders);
++            if (result != VK_SUCCESS)
++               return result;
++         }
+ 
+          const struct pan_ptr fbd = pan_ptr_offset(ir_fbds, fbd_sz * i);
+          const struct pan_fb_descs fb_descs = {
+@@ -2058,8 +2126,6 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+          assert(new_fbd_flags == fbd_flags);
+       }
+ 
+-      static_assert(ARRAY_SIZE(cmdbuf->state.gfx.render.ir.fbds) == PANVK_IR_PASS_COUNT,
+-                    "ir.fbds array size must match PANVK_IR_PASS_COUNT");
+       cmdbuf->state.gfx.render.ir.fbds[ir_pass] = ir_fbds.gpu;
+    }
+ 
+-- 
+2.55.0
+
