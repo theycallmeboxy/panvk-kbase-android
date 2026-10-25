@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:03:09 -0400
+Subject: [PATCH] panvk: gate the per-draw blend and depth-bounds sysval
+ compares on their dirty state
+
+cmd_prepare_draw_sysvals() (2.51% of PanVK's samples in the Arkham
+dxvk-cs profile) compared and stored, on every draw, the 8 blend
+descriptors and the depth-bounds, depth-bounds-enable and sample-count
+sysvals, then ran its 3-4 bitset AND/IS_EMPTY passes over the dirty
+sysvals even when nothing was dirty.
+
+- The blend descriptors are written only by blend_emit_descs(), which now
+  flags them; the compare loop runs only after that.
+- The depth-bounds block runs only when the depth-bounds enable or bounds,
+  the rasterization sample count or RENDER_STATE (attachments; meta
+  restore and the state resets set it too) is dirty.
+- With no sysval changed, the shader-usage masking is skipped: it would
+  find nothing.
+
+blend_emit_descs() also flagged the FS push uniforms on every run, which
+re-uploaded the FS FAU block after any blend-state change. The sysval
+compare already flags them when a descriptor or a blend constant the FS
+reads changes; the upload is still forced when needs_shader or
+shader_loads_blend_const flips, because blend constants are not tracked
+while unused.
+
+first_vertex and base_instance are still stored on every draw.
+
+PANVK_NO_SYSVAL_GATE=1 does every compare and the FS upload again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: D3: CPU per draw: the blend-descriptor sysval compare runs only after blend_emit_descs ran, the depth-bounds/sample-count block only on its dirty bits or RENDER_STATE, the mask passes only when a sysval changed; FS push uniforms are re-uploaded on blend changes only when needs_shader/shader_loads_blend_const flips. PANVK_NO_SYSVAL_GATE=1 reverts (try it first if blending is wrong right after a blend-state change)
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none; applies on the full g615-v11-csf series after rg477m/024
+Validation test: draw-path batch rg477m/023-027 on the device (drawcpu bench, DXVK pattern, 20,000 draws x 20 reps, pinned A715 at max clock, 10 interleaved runs per build): 543.6 -> 467.9 ns per recorded draw (-14%); with rg477m/024, 025 and 027 switched off 501.8 (the three together about -7%); PanProbe 38/38 x2; Arkham Asylum (CPU-bound DXVK, quietd Stock, 10 interleaved rounds + 3) gameplay fps unchanged (median 36.4 base vs 36.55), launch failures 0/13 base vs 2/13 (known B5 signatures, Fisher p~0.48, n.s.); combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/panvk_cmd_draw.h    | 18 ++++++++++++++++++
+ src/panfrost/vulkan/panvk_vX_blend.c    | 15 ++++++++++++++-
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c | 23 +++++++++++++++++++----
+ 3 files changed, 51 insertions(+), 5 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index 40f57acb..b6c44695 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -22,6 +22,7 @@
+ #include "vk_command_buffer.h"
+ #include "vk_format.h"
+ #include "vk_meta.h"
++#include "util/u_debug.h"
+ #include "util/u_tristate.h"
+ 
+ #include "pan_fb.h"
+@@ -195,6 +196,9 @@ struct panvk_cmd_graphics_state {
+       const struct panvk_shader *shader;
+       struct panvk_shader_desc_state desc;
+       uint64_t blend_descs[MAX_RTS];
++      /* blend_descs[] was rewritten since cmd_prepare_draw_sysvals() last
++       * copied it into the sysvals. */
++      bool blend_descs_changed;
+       uint64_t push_uniforms;
+       bool required;
+ #if PAN_ARCH < 9
+@@ -304,6 +308,20 @@ panvk_prerast_viewport_shader(const struct panvk_cmd_graphics_state *gfx)
+ }
+ #endif
+ 
++/* cmd_prepare_draw_sysvals() and blend_emit_descs() skip sysval compares and
++ * FS push uniform uploads whose inputs no dirty state says changed.
++ * PANVK_NO_SYSVAL_GATE=1 does all of them on every draw again. */
++static inline bool
++panvk_sysval_gate_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_SYSVAL_GATE", false);
++
++   return !disabled;
++}
++
+ #define dyn_gfx_state_dirty(__cmdbuf, __name)                                  \
+    BITSET_TEST((__cmdbuf)->vk.dynamic_graphics_state.dirty,                    \
+                MESA_VK_DYNAMIC_##__name)
+diff --git a/src/panfrost/vulkan/panvk_vX_blend.c b/src/panfrost/vulkan/panvk_vX_blend.c
+index 25ae0212..28112ff3 100644
+--- a/src/panfrost/vulkan/panvk_vX_blend.c
++++ b/src/panfrost/vulkan/panvk_vX_blend.c
+@@ -321,6 +321,8 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
+    memset(loc_rt, MESA_VK_ATTACHMENT_UNUSED, sizeof(loc_rt));
+    memset(rt_loc, MESA_VK_ATTACHMENT_UNUSED, sizeof(rt_loc));
+ 
++   const struct panvk_blend_info prev_blend_info = *blend_info;
++
+    memset(blend_info, 0, sizeof(*blend_info));
+    for (uint8_t i = 0; i < bs.rt_count; i++) {
+       struct pan_blend_rt_state *rt = &bs.rts[i];
+@@ -461,7 +463,18 @@ panvk_per_arch(blend_emit_descs)(struct panvk_cmd_buffer *cmdbuf,
+       }
+    }
+ 
+-   gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
++   cmdbuf->state.gfx.fs.blend_descs_changed = true;
++
++   /* cmd_prepare_draw_sysvals() flags the FS push uniforms when the
++    * descriptors or the constants it reads change. Whether the FS reads the
++    * blend constants at all changes with the blend shaders: re-upload then,
++    * the constants were not tracked while unused.
++    */
++   if (!panvk_sysval_gate_enabled() ||
++       prev_blend_info.needs_shader != blend_info->needs_shader ||
++       prev_blend_info.shader_loads_blend_const !=
++          blend_info->shader_loads_blend_const)
++      gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
+ 
+    return VK_SUCCESS;
+ }
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index d66153ec..0b6487c1 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -971,9 +971,15 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
+       }
+    }
+ 
+-   for (unsigned i = 0; i < MAX_RTS; i++) {
+-      set_gfx_sysval(cmdbuf, dirty_sysvals, fs.blend_descs[i],
+-                     cmdbuf->state.gfx.fs.blend_descs[i]);
++   const bool gate = panvk_sysval_gate_enabled();
++
++   /* Only blend_emit_descs() writes fs.blend_descs[], and it flags it. */
++   if (!gate || cmdbuf->state.gfx.fs.blend_descs_changed) {
++      for (unsigned i = 0; i < MAX_RTS; i++) {
++         set_gfx_sysval(cmdbuf, dirty_sysvals, fs.blend_descs[i],
++                        cmdbuf->state.gfx.fs.blend_descs[i]);
++      }
++      cmdbuf->state.gfx.fs.blend_descs_changed = false;
+    }
+ 
+    if (dyn_gfx_state_dirty(cmdbuf, VP_VIEWPORTS) ||
+@@ -1025,7 +1031,12 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
+ #endif
+ 
+ #if PAN_ARCH >= 9
+-   {
++   /* The attachments change only with RENDER_STATE, which meta restore and
++    * the state resets also set. */
++   if (!gate || dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_BOUNDS_TEST_ENABLE) ||
++       dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_BOUNDS_TEST_BOUNDS) ||
++       dyn_gfx_state_dirty(cmdbuf, MS_RASTERIZATION_SAMPLES) ||
++       gfx_state_dirty(cmdbuf, RENDER_STATE)) {
+       const struct vk_depth_stencil_state *dss =
+          &cmdbuf->vk.dynamic_graphics_state.ds;
+       const bool db_enable =
+@@ -1080,6 +1091,10 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
+    }
+ #endif
+ 
++   /* Nothing changed: the masks below would all come out empty. */
++   if (BITSET_IS_EMPTY(dirty_sysvals))
++      return;
++
+    /* We mask the dirty sysvals by the shader usage, and only flag
+     * the push uniforms dirty if those intersect. */
+    BITSET_DECLARE(dirty_shader_sysvals, MAX_SYSVAL_FAUS);
+-- 
+2.55.0
+
