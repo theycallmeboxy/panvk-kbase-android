@@ -1,0 +1,672 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:52:39 -0400
+Subject: [PATCH] panvk: report denormBehaviorIndependence 32_BIT_ONLY on
+ Valhall
+
+PanVK reported VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE on v9+, which
+caps vkd3d-proton's shader model detection at SM 6.0 (SM 6.2+ needs
+independent FP16/FP32 denorm modes).
+
+Valhall's FTZ modes cover (FP16, FP32) = (preserve, preserve),
+(preserve, flush) "DX11" and (flush, flush) "always". The one pair that
+32_BIT_ONLY newly allows and the hardware lacks, flush FP16 + preserve
+FP32, now runs in the preserve mode and the compiler flushes FP16 itself
+(bi_emulate_ftz_fp16): FLUSH.v2f16.ftz on every FP16 float result
+(including FP32->FP16 conversions) and on FP16 float operands that were
+not already flushed. Operand flushing is needed because NIR drops an
+fcanonicalize whose users are float ops, assuming they flush their
+operands as the hardware modes do. Bit-preserving ops are untouched.
+FP64 is unsupported, so FP16 and FP64 share a mode trivially.
+
+Only shaders with DenormFlushToZero 16 + DenormPreserve 32 take the new
+path; shaders without float controls compile exactly as before.
+PANVK_DENORM_INDEP=0 reports NONE again.
+
+With 32_BIT_ONLY, DXVK starts requesting DenormFlushToZero 32 (D3D11
+rules), so its shaders run in the DX11 mode, and on v11 floor/ceil
+flushed their operand with an extra CVT-pipe FLUSH. Skip that FLUSH
+when the operand comes from FADD/FMA (possibly through fneg/fabs/fsat):
+the FTZ mode already flushed that result.
+
+Channel: compatibility, unsafe
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: X2: report denormBehaviorIndependence = 32_BIT_ONLY on v9+ (was NONE), lifting PanVK's own SM 6.0 cap for vkd3d-proton; the fp16-flush/fp32-preserve pair Valhall has no mode for runs in PRESERVE with a new bi_emulate_ftz_fp16 pass; DXVK now requests FTZ32, so its shaders run in the hardware DX11 mode, and the v11 FLUSH before floor/ceil is skipped after FADD/FMA results. Shaders without float controls compile as before. PANVK_DENORM_INDEP=0 reverts
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none; applies on the full g615-v11-csf series after rg477m/028
+Validation test: host bifrost_tests 78/78 (8 new EmulateFtzFp16 cases); denorm_check on the device exact for fp16-preserve/fp32-flush (vkd3d's pair; DX11 mode keeps fp16 denormals) and fp16-flush/fp32-preserve (emulated); PanProbe 38/38 x2; Hades (DXVK, now DX11 float mode) A-B-B-A x2 at 1255 MHz uncapped: 226.2 base vs 226.5 fps, 0 GPU faults; combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks; a dedicated D3D12 game check still pending; known pre-existing B16 (fp16 not flushed for flush/flush) unchanged
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ .../compiler/bifrost/bi_emulate_ftz_fp16.c    | 191 ++++++++++++++++++
+ .../compiler/bifrost/bifrost_compile.c        |  44 +++-
+ src/panfrost/compiler/bifrost/compiler.h      |   4 +
+ src/panfrost/compiler/bifrost/meson.build     |   1 +
+ .../compiler/bifrost/test/meson.build         |   1 +
+ .../bifrost/test/test-emulate-ftz-fp16.cpp    | 170 ++++++++++++++++
+ src/panfrost/compiler/pan_compiler.c          |  26 ++-
+ src/panfrost/compiler/pan_compiler.h          |   6 +-
+ .../vulkan/panvk_vX_physical_device.c         |  13 +-
+ src/panfrost/vulkan/panvk_vX_shader.c         |   4 +-
+ 10 files changed, 447 insertions(+), 13 deletions(-)
+ create mode 100644 src/panfrost/compiler/bifrost/bi_emulate_ftz_fp16.c
+ create mode 100644 src/panfrost/compiler/bifrost/test/test-emulate-ftz-fp16.cpp
+
+diff --git a/src/panfrost/compiler/bifrost/bi_emulate_ftz_fp16.c b/src/panfrost/compiler/bifrost/bi_emulate_ftz_fp16.c
+new file mode 100644
+index 00000000..e3df1d68
+--- /dev/null
++++ b/src/panfrost/compiler/bifrost/bi_emulate_ftz_fp16.c
+@@ -0,0 +1,191 @@
++/*
++ * Copyright 2026 theycallmeboxy
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "valhall/valhall.h"
++#include "bi_builder.h"
++#include "compiler.h"
++
++/*
++ * Valhall has no "flush FP16 denormals, preserve FP32 denormals" FTZ mode.
++ * Shaders that ask for it run in the "preserve subnormals" mode, and this pass
++ * gives FP16 the behaviour of the "always" mode with FLUSH.v2f16.ftz:
++ *
++ * - Every FP16 result of float arithmetic is flushed, as DenormFlushToZero
++ *   requires for OpFAdd, OpFMul, OpFNegate, FAbs, FMin, OpFConvert etc.
++ *
++ * - Every FP16 operand of a float operation is flushed unless it already was
++ *   (it comes from one of the results above, or cannot be a denormal).
++ *   Operands "may" be flushed, so this is valid, and it is needed: NIR drops
++ *   an fcanonicalize (from e.g. fmul(a, 1.0)) whose users are float
++ *   operations, on the grounds that they flush their operands, as the
++ *   hardware FTZ modes do.
++ *
++ * Bit-preserving operations (moves, selects, phis, stores, bitcasts) are left
++ * alone, as they must not flush. Cooperative matrix MMUL is not covered by
++ * the float controls rules and is left alone too.
++ *
++ * Runs on SSA, before the optimisation passes, so that modifier propagation
++ * sees the flushes.
++ */
++
++/* FP16 float results to flush */
++static bool
++writes_fp16_float(const bi_instr *I)
++{
++   switch (I->op) {
++   case BI_OPCODE_FADD_V2F16:
++   case BI_OPCODE_FADD_IMM_V2F16:
++   case BI_OPCODE_FMA_V2F16:
++   case BI_OPCODE_FMA_RSCALE_V2F16:
++   case BI_OPCODE_FMIN_V2F16:
++   case BI_OPCODE_FMAX_V2F16:
++   case BI_OPCODE_FABSNEG_V2F16:
++   case BI_OPCODE_FCLAMP_V2F16:
++   case BI_OPCODE_FRCP_F16:
++   case BI_OPCODE_FRSQ_F16:
++   case BI_OPCODE_LDEXP_V2F16:
++   case BI_OPCODE_V2F32_TO_V2F16:
++      return true;
++   default:
++      /* FP32 arithmetic written to one half converts to FP16 */
++      return va_op_dest_modifier_does_convert(I->op) &&
++             I->dest[0].swizzle != BI_SWIZZLE_H01;
++   }
++}
++
++/* Producers whose FP16 result is never a denormal */
++static bool
++writes_fp16_canonical(const bi_instr *I)
++{
++   switch (I->op) {
++   case BI_OPCODE_FLUSH_V2F16:
++      return I->ftz;
++   case BI_OPCODE_FROUND_V2F16:   /* integral */
++   case BI_OPCODE_FREXPM_V2F16:   /* mantissa, 0.5 <= |m| < 1 */
++   case BI_OPCODE_V2S16_TO_V2F16: /* integers */
++   case BI_OPCODE_V2U16_TO_V2F16:
++   case BI_OPCODE_V2S8_TO_V2F16:
++   case BI_OPCODE_V2U8_TO_V2F16:
++      return true;
++   default:
++      return false;
++   }
++}
++
++/* FP16 float operands, as a source mask */
++static unsigned
++reads_fp16_float(const bi_instr *I)
++{
++   switch (I->op) {
++   case BI_OPCODE_FMA_V2F16:
++   case BI_OPCODE_FMA_RSCALE_V2F16: /* src3 is the integer scale */
++      return BITFIELD_MASK(3);
++   case BI_OPCODE_FADD_V2F16:
++   case BI_OPCODE_FMIN_V2F16:
++   case BI_OPCODE_FMAX_V2F16:
++   case BI_OPCODE_FCMP_V2F16:
++   case BI_OPCODE_CSEL_V2F16:       /* src2/3 are selected, not compared */
++      return BITFIELD_MASK(2);
++   case BI_OPCODE_FADD_IMM_V2F16:
++   case BI_OPCODE_FABSNEG_V2F16:
++   case BI_OPCODE_FCLAMP_V2F16:
++   case BI_OPCODE_FRCP_F16:
++   case BI_OPCODE_FRSQ_F16:
++   case BI_OPCODE_LDEXP_V2F16:      /* src1 is the integer exponent */
++   case BI_OPCODE_FROUND_V2F16:
++   case BI_OPCODE_FREXPM_V2F16:
++   case BI_OPCODE_FREXPE_V2F16:
++   case BI_OPCODE_F16_TO_F32:
++      return BITFIELD_BIT(0);
++   default:
++      return 0;
++   }
++}
++
++static uint32_t
++flush_fp16_denorms_u32(uint32_t v)
++{
++   for (unsigned h = 0; h < 2; ++h) {
++      uint32_t half = (v >> (16 * h)) & 0xffff;
++
++      /* Exponent zero, mantissa non-zero: keep the sign only */
++      if (!(half & 0x7c00) && (half & 0x03ff))
++         v &= ~(0x7fffu << (16 * h));
++   }
++
++   return v;
++}
++
++void
++bi_emulate_ftz_fp16(bi_context *ctx)
++{
++   /* Producer of every SSA value as emitted, before we add anything */
++   bi_instr **lut = rzalloc_array(ctx, bi_instr *, ctx->ssa_alloc);
++
++   bi_foreach_instr_global(ctx, I) {
++      bi_foreach_dest(I, d) {
++         if (bi_is_ssa(I->dest[d]))
++            lut[I->dest[d].value] = I;
++      }
++   }
++
++   unsigned nr_values = ctx->ssa_alloc;
++
++   bi_foreach_instr_global_safe(ctx, I) {
++      unsigned operands = reads_fp16_float(I);
++
++      u_foreach_bit(s, operands) {
++         bi_index src = I->src[s];
++
++         if (src.type == BI_INDEX_CONSTANT) {
++            /* Covers both halves whatever the swizzle */
++            I->src[s].value = flush_fp16_denorms_u32(src.value);
++            continue;
++         }
++
++         if (src.type != BI_INDEX_NORMAL && src.type != BI_INDEX_FAU)
++            continue;
++
++         if (bi_is_ssa(src) && src.value < nr_values && lut[src.value] &&
++             (writes_fp16_float(lut[src.value]) ||
++              writes_fp16_canonical(lut[src.value])))
++            continue;
++
++         /* Flush the whole register, the operand keeps its swizzle and
++          * modifiers. */
++         bi_builder b = bi_init_builder(ctx, bi_before_instr(I));
++         bi_instr *flush =
++            bi_flush_to(&b, 16, bi_temp(ctx), bi_strip_index(src));
++         flush->ftz = true;
++
++         I->src[s] = bi_replace_index(src, flush->dest[0]);
++      }
++
++      if (writes_fp16_float(I)) {
++         bi_index dest = I->dest[0];
++         bi_index tmp = bi_temp(ctx);
++
++         /* A converting FP32 operation writes one half: keep that, then
++          * flush it to both halves of the real destination, which FP16
++          * users read through their own swizzles. */
++         tmp.swizzle = dest.swizzle;
++         I->dest[0] = tmp;
++
++         bi_index src = tmp;
++         if (dest.swizzle == BI_SWIZZLE_H00 || dest.swizzle == BI_SWIZZLE_H11)
++            src.swizzle = dest.swizzle;
++         else
++            src.swizzle = BI_SWIZZLE_H01;
++
++         dest.swizzle = BI_SWIZZLE_H01;
++
++         bi_builder b = bi_init_builder(ctx, bi_after_instr(I));
++         bi_instr *flush = bi_flush_to(&b, 16, dest, src);
++         flush->ftz = true;
++      }
++   }
++
++   ralloc_free(lut);
++}
+diff --git a/src/panfrost/compiler/bifrost/bifrost_compile.c b/src/panfrost/compiler/bifrost/bifrost_compile.c
+index 15a8152e..4422f3ac 100644
+--- a/src/panfrost/compiler/bifrost/bifrost_compile.c
++++ b/src/panfrost/compiler/bifrost/bifrost_compile.c
+@@ -2619,6 +2619,37 @@ bi_nir_is_replicated(nir_alu_src *src)
+    return true;
+ }
+ 
++/*
++ * Whether a 32-bit float value was produced by FMA-pipe arithmetic (FADD,
++ * FMA), whose result the shader's FTZ mode has already flushed, possibly
++ * through fneg/fabs/fsat, which become source modifiers, a clamp or another
++ * FADD. FADD with a constant operand is left out because it may become
++ * FADD_IMM.
++ */
++static bool
++bi_nir_is_ftz_flushed_fp32(nir_def *def, unsigned depth)
++{
++   if (def->bit_size != 32 || !nir_def_is_alu(def) || depth > 4)
++      return false;
++
++   nir_alu_instr *alu = nir_def_as_alu(def);
++
++   switch (alu->op) {
++   case nir_op_fmul:
++   case nir_op_ffma:
++      return true;
++   case nir_op_fadd:
++      return !nir_src_is_const(alu->src[0].src) &&
++             !nir_src_is_const(alu->src[1].src);
++   case nir_op_fneg:
++   case nir_op_fabs:
++   case nir_op_fsat:
++      return bi_nir_is_ftz_flushed_fp32(alu->src[0].src.ssa, depth + 1);
++   default:
++      return false;
++   }
++}
++
+ static void
+ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
+ {
+@@ -3284,10 +3315,12 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
+       enum bi_round round = bi_nir_round(instr->op);
+ 
+       /* On v11+, FROUND does not flush subnormals to zero even when configured
+-       * in the shader program header */
++       * in the shader program header. Skip the flush when the operand was
++       * already flushed by the arithmetic that produced it. */
+       if (b->shader->arch >= 11 &&
+           (round == BI_ROUND_RTP || round == BI_ROUND_RTN) &&
+-          b->shader->ftz_fp32) {
++          b->shader->ftz_fp32 &&
++          !bi_nir_is_ftz_flushed_fp32(instr->src[0].src.ssa, 0)) {
+          bi_instr *flush = bi_flush_to(b, 32, bi_temp(b->shader), s0);
+          flush->ftz = true;
+          s0 = flush->dest[0];
+@@ -4318,6 +4351,7 @@ bi_compile_variant_nir(nir_shader *nir,
+    ctx->rtz_fp16 = nir_is_rounding_mode_rtz(execution_mode, 16);
+    ctx->rtz_fp32 = nir_is_rounding_mode_rtz(execution_mode, 32);
+    ctx->ftz_fp32 = nir_is_denorm_flush_to_zero(execution_mode, 32);
++   ctx->emulate_ftz_fp16 = pan_emulate_ftz_fp16(ctx->arch, execution_mode);
+ 
+    if (idvs == BI_IDVS_POSITION || idvs == BI_IDVS_VARYING) {
+       /* Specializing shaders for IDVS is destructive, so we need to
+@@ -4391,6 +4425,12 @@ bi_compile_variant_nir(nir_shader *nir,
+    bi_lower_swizzle(ctx);
+    bi_validate(ctx, "Early lowering");
+ 
++   /* Runs after swizzle lowering, which settles destination swizzles */
++   if (ctx->emulate_ftz_fp16) {
++      bi_emulate_ftz_fp16(ctx);
++      bi_validate(ctx, "FP16 flush-to-zero emulation");
++   }
++
+    /* Runs before copy prop */
+    if (optimize && ctx->inputs->fau.pushable_ubos) {
+       bi_opt_push_ubo(ctx);
+diff --git a/src/panfrost/compiler/bifrost/compiler.h b/src/panfrost/compiler/bifrost/compiler.h
+index 0c82eceb..2080a61b 100644
+--- a/src/panfrost/compiler/bifrost/compiler.h
++++ b/src/panfrost/compiler/bifrost/compiler.h
+@@ -1277,6 +1277,9 @@ typedef struct {
+    bool rtz_fp32;
+    bool ftz_fp32;
+ 
++   /* FP16 flushed by the compiler, see pan_emulate_ftz_fp16() */
++   bool emulate_ftz_fp16;
++
+    /* In any graphics shader, whether the "IDVS with memory
+     * allocation" flow is used. This affects how varyings are loaded and
+     * stored. Ignore for compute.
+@@ -1665,6 +1668,7 @@ void bi_opt_message_preload(bi_context *ctx);
+ void bi_opt_push_ubo(bi_context *ctx);
+ void bi_opt_reorder_push(bi_context *ctx);
+ void bi_lower_swizzle(bi_context *ctx);
++void bi_emulate_ftz_fp16(bi_context *ctx);
+ void bi_lower_fau(bi_context *ctx);
+ uint64_t bi_instr_read_mask(bi_instr *I, bool staging_only);
+ uint64_t bi_instr_write_mask(bi_instr *I);
+diff --git a/src/panfrost/compiler/bifrost/meson.build b/src/panfrost/compiler/bifrost/meson.build
+index f8c94cbc..0e28027b 100644
+--- a/src/panfrost/compiler/bifrost/meson.build
++++ b/src/panfrost/compiler/bifrost/meson.build
+@@ -32,6 +32,7 @@ libpanfrost_bifrost_files = files(
+   'bi_repair_ssa.c',
+   'bi_validate.c',
+   'bi_dominance.c',
++  'bi_emulate_ftz_fp16.c',
+   'bi_debug.c',
+   'bir.c',
+   'bifrost_compile.c',
+diff --git a/src/panfrost/compiler/bifrost/test/meson.build b/src/panfrost/compiler/bifrost/test/meson.build
+index b29936a9..85319dd4 100644
+--- a/src/panfrost/compiler/bifrost/test/meson.build
++++ b/src/panfrost/compiler/bifrost/test/meson.build
+@@ -8,6 +8,7 @@ test(
+     files(
+       'test-constant-fold.cpp',
+       'test-dual-texture.cpp',
++      'test-emulate-ftz-fp16.cpp',
+       'test-lower-swizzle.cpp',
+       'test-message-preload.cpp',
+       'test-optimizer.cpp',
+diff --git a/src/panfrost/compiler/bifrost/test/test-emulate-ftz-fp16.cpp b/src/panfrost/compiler/bifrost/test/test-emulate-ftz-fp16.cpp
+new file mode 100644
+index 00000000..d071bda2
+--- /dev/null
++++ b/src/panfrost/compiler/bifrost/test/test-emulate-ftz-fp16.cpp
+@@ -0,0 +1,170 @@
++/*
++ * Copyright 2026 theycallmeboxy
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "bi_builder.h"
++#include "bi_test.h"
++#include "compiler.h"
++
++#include <gtest/gtest.h>
++
++/* reg, x, y, z are SSA values 0-3 in both shaders; values without a producer
++ * stand for loads, which may hold denormals. */
++#define CASE(instr, expected)                                                  \
++   INSTRUCTION_CASE(                                                           \
++      {                                                                        \
++         UNUSED bi_index reg = bi_temp(b->shader);                             \
++         UNUSED bi_index x = bi_temp(b->shader);                               \
++         UNUSED bi_index y = bi_temp(b->shader);                               \
++         UNUSED bi_index z = bi_temp(b->shader);                               \
++         instr;                                                                \
++         bi_kaboom(b, reg);                                                    \
++      },                                                                       \
++      {                                                                        \
++         UNUSED bi_index reg = bi_temp(b->shader);                             \
++         UNUSED bi_index x = bi_temp(b->shader);                               \
++         UNUSED bi_index y = bi_temp(b->shader);                               \
++         UNUSED bi_index z = bi_temp(b->shader);                               \
++         expected;                                                             \
++         bi_kaboom(b, reg);                                                    \
++      },                                                                       \
++      bi_emulate_ftz_fp16);
++
++#define NEGCASE(instr) CASE(instr, instr)
++
++static bi_index
++ftz(bi_builder *b, bi_index dest, bi_index src)
++{
++   bi_instr *I = bi_flush_to(b, 16, dest, src);
++   I->ftz = true;
++   return I->dest[0];
++}
++
++class EmulateFtzFp16 : public testing::Test {
++ protected:
++   EmulateFtzFp16()
++   {
++      mem_ctx = ralloc_context(NULL);
++      arch = 11;
++   }
++
++   ~EmulateFtzFp16()
++   {
++      ralloc_free(mem_ctx);
++   }
++
++   void *mem_ctx;
++   unsigned arch;
++};
++
++TEST_F(EmulateFtzFp16, OperandsAndResult)
++{
++   CASE(bi_fadd_v2f16_to(b, reg, x, y), {
++      bi_index fx = ftz(b, bi_temp(b->shader), x);
++      bi_index fy = ftz(b, bi_temp(b->shader), y);
++      bi_index t = bi_temp(b->shader);
++      bi_fadd_v2f16_to(b, t, fx, fy);
++      ftz(b, reg, t);
++   });
++}
++
++TEST_F(EmulateFtzFp16, ModifiersStayOnOperand)
++{
++   CASE(bi_fadd_v2f16_to(b, reg, bi_neg(bi_half(x, true)), bi_abs(y)), {
++      bi_index fx = ftz(b, bi_temp(b->shader), x);
++      bi_index fy = ftz(b, bi_temp(b->shader), y);
++      bi_index t = bi_temp(b->shader);
++      bi_fadd_v2f16_to(b, t, bi_neg(bi_half(fx, true)), bi_abs(fy));
++      ftz(b, reg, t);
++   });
++}
++
++TEST_F(EmulateFtzFp16, FlushedResultIsNotFlushedAgain)
++{
++   CASE(
++      {
++         bi_index s = bi_fadd_v2f16(b, x, x);
++         bi_fma_v2f16_to(b, reg, s, s, bi_negzero());
++      },
++      {
++         bi_index s = bi_temp(b->shader);
++         bi_index fx = ftz(b, bi_temp(b->shader), x);
++         bi_index fx2 = ftz(b, bi_temp(b->shader), x);
++         bi_index t = bi_temp(b->shader);
++         bi_fadd_v2f16_to(b, t, fx, fx2);
++         ftz(b, s, t);
++         bi_index t2 = bi_temp(b->shader);
++         bi_fma_v2f16_to(b, t2, s, s, bi_negzero());
++         ftz(b, reg, t2);
++      });
++}
++
++TEST_F(EmulateFtzFp16, DenormalConstants)
++{
++   CASE(bi_fadd_v2f16_to(b, reg, bi_imm_u32(0x83ff0001), bi_imm_u32(0x3c000400)),
++        {
++           bi_index t = bi_temp(b->shader);
++           bi_fadd_v2f16_to(b, t, bi_imm_u32(0x80000000),
++                            bi_imm_u32(0x3c000400));
++           ftz(b, reg, t);
++        });
++}
++
++TEST_F(EmulateFtzFp16, SelectsDoNotFlush)
++{
++   CASE(bi_csel_v2f16_to(b, reg, x, y, z, x, BI_CMPF_LT), {
++      bi_index fx = ftz(b, bi_temp(b->shader), x);
++      bi_index fy = ftz(b, bi_temp(b->shader), y);
++      bi_csel_v2f16_to(b, reg, fx, fy, z, x, BI_CMPF_LT);
++   });
++
++   NEGCASE(bi_mov_i32_to(b, reg, x));
++}
++
++TEST_F(EmulateFtzFp16, Fp32ToFp16)
++{
++   /* FADD.f32 into one half is the Valhall f32 -> f16 conversion */
++   CASE(bi_fadd_f32_to(b, bi_half(reg, true), x, bi_negzero()), {
++      bi_index t = bi_temp(b->shader);
++      bi_fadd_f32_to(b, bi_half(t, true), x, bi_negzero());
++      ftz(b, reg, bi_half(t, true));
++   });
++
++   /* Plain FP32 arithmetic is left alone */
++   NEGCASE(bi_fadd_f32_to(b, reg, x, y));
++}
++
++TEST_F(EmulateFtzFp16, Fp16ToFp32)
++{
++   CASE(bi_f16_to_f32_to(b, reg, bi_half(x, true)), {
++      bi_index fx = ftz(b, bi_temp(b->shader), x);
++      bi_f16_to_f32_to(b, reg, bi_half(fx, true));
++   });
++}
++
++TEST_F(EmulateFtzFp16, ValidatesInContext)
++{
++   bi_builder *b = bit_builder(mem_ctx, arch);
++   bi_index x = bi_mov_i32(b, bi_register(1));
++   bi_index y = bi_mov_i32(b, bi_register(2));
++   bi_index z = bi_mov_i32(b, bi_register(3));
++   bi_index h = bi_fadd_v2f16(b, bi_half(x, false), y);
++   bi_index m = bi_fma_v2f16(b, h, bi_neg(y), bi_imm_u32(0x00010001));
++   bi_index c = bi_temp(b->shader);
++   bi_fadd_f32_to(b, bi_half(c, false), z, bi_negzero());
++   bi_index w = bi_f16_to_f32(b, bi_half(m, true));
++   bi_index s = bi_csel_v2f16(b, m, c, x, y, BI_CMPF_LT);
++   bi_kaboom(b, bi_fadd_f32(b, w, bi_mov_i32(b, s)));
++
++   bi_emulate_ftz_fp16(b->shader);
++   bi_validate(b->shader, "test");
++
++   unsigned flushes = 0;
++   bi_foreach_instr_global(b->shader, I)
++      flushes += I->op == BI_OPCODE_FLUSH_V2F16 && I->ftz;
++
++   /* Operands: x and y into the FADD, y into the FMA. Results: FADD, FMA and
++    * the f32->f16 conversion. The CSEL compares two flushed results. */
++   EXPECT_EQ(flushes, 3 + 3);
++}
+diff --git a/src/panfrost/compiler/pan_compiler.c b/src/panfrost/compiler/pan_compiler.c
+index 8c99ff42..412e6dab 100644
+--- a/src/panfrost/compiler/pan_compiler.c
++++ b/src/panfrost/compiler/pan_compiler.c
+@@ -354,17 +354,31 @@ pan_shader_update_info(struct pan_shader_info *info, nir_shader *s,
+    info->ftz_fp32 = nir_is_denorm_flush_to_zero(execution_mode, 32);
+ 
+    if (arch >= 9) {
+-      /* Valhall hardware doesn't have a "flush FP16, preserve FP32" mode, and
+-       * we don't advertise independent FP16/FP32 denorm modes in panvk, but
+-       * it's still possible to have shaders that don't specify any denorm mode
+-       * for FP32. In that case, default to flush FP32. */
+-      if (info->ftz_fp16 && !info->ftz_fp32) {
+-         assert(!nir_is_denorm_preserve(execution_mode, 32));
++      if (pan_emulate_ftz_fp16(arch, execution_mode)) {
++         /* Run with denormals preserved, the compiler flushes FP16 */
++         info->ftz_fp16 = false;
++      } else if (info->ftz_fp16 && !info->ftz_fp32) {
++         /* FP32 has no denorm mode, so flushing it is allowed */
+          info->ftz_fp32 = true;
+       }
+    }
+ }
+ 
++/*
++ * Valhall's FTZ modes are "preserve", DX11 (flush FP32, preserve FP16) and
++ * "always" (flush both); there is no "flush FP16, preserve FP32" mode. A
++ * shader that asks for exactly that (DenormFlushToZero 16 + DenormPreserve 32,
++ * legal once the driver reports a denormBehaviorIndependence other than NONE)
++ * runs with denormals preserved, and the compiler flushes FP16 explicitly:
++ * bi_emulate_ftz_fp16().
++ */
++bool
++pan_emulate_ftz_fp16(unsigned arch, unsigned float_controls)
++{
++   return arch >= 9 && nir_is_denorm_flush_to_zero(float_controls, 16) &&
++          nir_is_denorm_preserve(float_controls, 32);
++}
++
+ void
+ pan_shader_compile(nir_shader *s, struct pan_compile_inputs *inputs,
+                    struct util_dynarray *binary, struct pan_shader_info *info)
+diff --git a/src/panfrost/compiler/pan_compiler.h b/src/panfrost/compiler/pan_compiler.h
+index b71fac10..6b7ca11b 100644
+--- a/src/panfrost/compiler/pan_compiler.h
++++ b/src/panfrost/compiler/pan_compiler.h
+@@ -24,6 +24,7 @@ uint32_t pan_get_compiler_flags(unsigned arch);
+ bool pan_will_dump_shaders(unsigned arch);
+ bool pan_want_debug_info(unsigned arch);
+ bool pan_use_kraid(unsigned arch, mesa_shader_stage stage, bool internal);
++bool pan_emulate_ftz_fp16(unsigned arch, unsigned float_controls);
+ 
+ const nir_shader_compiler_options *
+ pan_get_nir_shader_compiler_options(unsigned arch,
+@@ -532,7 +533,10 @@ struct pan_shader_info {
+    bool writes_global;
+    uint64_t outputs_written;
+ 
+-   /* Floating point controls that the driver should try to honour */
++   /* Flush-to-zero behaviour the hardware mode must provide (on Valhall, the
++    * FTZ mode of the shader program descriptor). This can differ from the
++    * shader's execution modes: see pan_emulate_ftz_fp16().
++    */
+    bool ftz_fp16, ftz_fp32;
+ 
+    /* True if the shader contains a shader_clock instruction. */
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 6193b467..335c8f7f 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -28,6 +28,8 @@
+ #include "pan_format.h"
+ #include "pan_props.h"
+ 
++#include "util/u_debug.h"
++
+ #ifndef PANVK_KBASE_RELEASE
+ #define PANVK_KBASE_RELEASE "RC3-lowmem"
+ #endif
+@@ -1097,9 +1099,16 @@ panvk_per_arch(get_physical_device_properties)(
+       /* VK_KHR_driver_properties */
+       .driverID = VK_DRIVER_ID_MESA_PANVK,
+       .conformanceVersion = get_conformance_version(),
++      /* Valhall has FTZ modes for (FP16, FP32) = (preserve, preserve),
++       * (preserve, flush) and (flush, flush); the compiler emulates (flush,
++       * preserve) with explicit flushes. FP64 is not supported, so FP16 and
++       * FP64 share a mode trivially. PANVK_DENORM_INDEP=0 restores NONE.
++       */
+       .denormBehaviorIndependence =
+-         PAN_ARCH >= 9 ? VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE
+-                       : VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
++         PAN_ARCH < 9 ? VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL
++         : debug_get_bool_option("PANVK_DENORM_INDEP", true)
++            ? VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY
++            : VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
+       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+       .shaderSignedZeroInfNanPreserveFloat16 = true,
+       .shaderSignedZeroInfNanPreserveFloat32 = true,
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index ce2a64db..0c705290 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -3165,8 +3165,8 @@ shader_ftz_mode(struct panvk_shader_variant *shader)
+       else
+          return MALI_FLUSH_TO_ZERO_MODE_DX11;
+    } else {
+-      /* We don't have a "flush FP16, preserve FP32" mode, but APIs
+-       * should not be able to generate that.
++      /* There is no "flush FP16, preserve FP32" mode: the compiler flushes
++       * FP16 itself for that combination (pan_emulate_ftz_fp16()).
+        */
+       assert(!shader->info.ftz_fp16 && !shader->info.ftz_fp32);
+       return MALI_FLUSH_TO_ZERO_MODE_PRESERVE_SUBNORMALS;
+-- 
+2.55.0
+
