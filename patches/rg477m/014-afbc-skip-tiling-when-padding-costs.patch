@@ -25,6 +25,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: csf-v11/151
 Validation test: vkGetImageMemoryRequirements with mips: RGBA8 64x64 487424 -> 28672 B, 128x128 557056 -> 94208, 256x256 823296 -> 360448, 512x512 1888256 -> 1425408, D24S8 64x64 516096 -> 28672; 1024+ unchanged (still tiled). Hades x64Vk at 1255 MHz uncapped A-B-B-A: 176.5/172.4 -> 176.4/174.9 fps; Megabonk GPU memory 1400 -> 1325 MB, Valheim and Moonlighter unchanged (DXVK suballocates); racetest all cases 0/100 stale, controls 100/100; drawbench image checksums identical (8 tests)
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/lib/pan_mod.c | 23 +++++++++++++++++++++++

@@ -38,6 +38,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: rg477m/001 (fixes it); applies on the full g615-v11-csf series after rg477m/020
 Validation test: Arkham Asylum launch + checkpoint restart, interleaved on one build: specks 0/9 valid runs vs 6/7 with PANVK_KBASE_PRIVATE_LOCAL=1 (10 rounds per arm, one-sided Fisher p<0.001); ASTC mips with missing blocks after copy 0 of 11006 vs 310 of 11005 in one launch; game context imports 2278 outer (c43e) + 19 exported inner (c23e); no GPU faults in 20 runs; PanProbe 38/38 x3; frame rate at 1255 MHz unchanged (Arkham 25.35 vs 25.15 fps, Hades 227.7 vs 228.5); no shareability faults in 8 Hades runs
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/lib/kmod/kbase_kmod.c        | 15 ++++++++++++++-

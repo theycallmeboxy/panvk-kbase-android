@@ -48,6 +48,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11, 8 GB)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: csf-v11/085
 Validation test: 8 GB: limit/heap 4284 MiB, critical 325 MiB. memhog: refused at 4234 MiB held with 2 GB free (retries refused); with PAN_MEM_LIMIT_MB=7000 grows to 6154 MiB while swap absorbs pressure, then logs and SIGKILLs itself at MemAvailable 320 MiB, no lmkd kills. Games (GameNative, PanVK): Valheim 2.05 GB GPU, MemAvailable min 623 MiB, no refusals, 57 fps; Megabonk 60 fps; Jupiter Hell (previously panicked the kernel at ~9 GB) has its 3.6 GB request refused and reaches its loading screen; Descenders refused at 4.08 GB and exits (stock driver reached 5.3 GB with 295 MiB free); racetest all cases 0/100 stale, controls 100/100; drawbench image checksums identical to csf-v11/193 (8 tests)
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/lib/kmod/pan_kmod.c            | 216 ++++++++++++++++++++

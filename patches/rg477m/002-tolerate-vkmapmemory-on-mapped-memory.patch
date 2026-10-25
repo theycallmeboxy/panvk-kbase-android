@@ -22,6 +22,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: csf-v11/091
 Validation test: map_test (double map returns VK_SUCCESS + same pointer, like the DDK); Hades (DXVK) renders fully in GameNative; PanProbe 38/38
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/panvk_device_memory.c | 26 ++++++++++++++++++++---

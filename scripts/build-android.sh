@@ -1,6 +1,6 @@
 #!/bin/sh
 # build-android.sh — Android/Bionic arm64-v8a PanVK (hot-loadable ICD + Android/X11 WSI + AHB + Kbase)
-# Usage: ./scripts/build-android.sh --profile g615-v11-csf [--api 35] [--ndk $ANDROID_NDK_ROOT] [--panvk-profile compat|fast]
+# Usage: ./scripts/build-android.sh --profile g615-v11-csf [--api 35] [--ndk $ANDROID_NDK_ROOT] [--panvk-profile compat|unsafe]
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROFILE=""; PANVK_PROFILE=""; API="${ANDROID_API:-35}"; NDK="${ANDROID_NDK_ROOT:-${ANDROID_HOME:-/opt/android-sdk}/ndk}"

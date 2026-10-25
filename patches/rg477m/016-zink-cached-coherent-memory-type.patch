@@ -40,6 +40,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none of ours; applies on the full g615-v11-csf series
 Validation test: cohtest (CPU reads after GPU fill, GPU copy after CPU write, 4 KiB-4 MiB, completion via vkQueueWaitIdle / vkWaitSemaphores / vkGetSemaphoreCounterValue polling): 0 stale / 0 missing words on the new type (the plain cached type without maintenance: millions); Jupiter Hell main menu 50.7 -> 59.7 fps at default clocks, first level unchanged (13.4 vs 13.9); Megabonk 60 fps (42 when forced on for DXVK); Hades x64Vk at 1255 MHz 173.3 vs 172.4 fps; drawbench 8/8, racetest, msrtss identical
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c |  4 +

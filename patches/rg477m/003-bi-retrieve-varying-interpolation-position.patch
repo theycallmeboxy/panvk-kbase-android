@@ -31,6 +31,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none
 Validation test: blended full-screen quads reading UV + colour 2.01 -> 1.35 ms (DDK 1.26), framebuffer checksums identical with and without the pass; PanProbe 38/38. 2026-10-19: pass moved after scheduling/RA; Batman: Arkham Asylum's title and menu backgrounds (blocky noise before, correct on the stock driver and with noretrieve) now render correctly; drawbench fill 32 with UV + colour 1.65 ms (2.50 with noretrieve), drawbench 6 tests' checksums and racetest 5 modes identical to the previous build, PanProbe 38/38
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/compiler/bifrost/bi_debug.c      |  1 +

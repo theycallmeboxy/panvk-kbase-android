@@ -19,6 +19,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none
 Validation test: drawbench loadpasses ~5% faster on its own; with csf-v11/191 see there; PanProbe 38/38
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c |  4 ++++

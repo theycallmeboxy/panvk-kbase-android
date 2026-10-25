@@ -28,6 +28,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: rg477m/009
 Validation test: drawbench loadpasses 64 at 1255 MHz 1.22 -> 1.04 ms; Hades Vulkan renderer 1255 MHz 160.0 -> 170.3 fps, normal clocks 51.5 -> 59.6 fps; Hades DXVK 103.2 -> 103.3 fps at 502 MHz; Serious Sam (189-191 together) Vulkan 51.9 -> 52.9, D3D11 46.5 -> 47.0 fps; racetest incl. direct render pass -> vertex shader 0/100 stale, controls 100/100; drawbench image checksums unchanged; PanProbe 38/38
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/csf/panvk_cmd_buffer.h    |  7 ++

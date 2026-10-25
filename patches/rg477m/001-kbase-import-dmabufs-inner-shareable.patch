@@ -22,6 +22,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: kbase-common/files (kbase_kmod.c), csf-v11/110
 Validation test: PanProbe 38/38 x3; Hades 0/7 launches faulting (8/8 before); Moonlighter 0/6 (5/5 before)
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/lib/kmod/kbase_kmod.c | 9 ++++++++-

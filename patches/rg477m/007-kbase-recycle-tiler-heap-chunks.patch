@@ -34,6 +34,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: csf-v11/110 (kbase backend); replaces the heap-op skip it introduced
 Validation test: drawbench 8000 draws 5.5 -> 1.10 ms (DDK 1.49), 40000 draws 33.5 -> 4.95 ms (DDK 8.08), checksums identical to the DDK on 12 tests; clear-only passes + heap growth 60 s without kbase heap-statistics errors; Hades and Serious Sam unchanged; no GPU faults
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/csf/panvk_cmd_buffer.h   | 15 +++++++++++++++

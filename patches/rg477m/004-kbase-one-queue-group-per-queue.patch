@@ -23,6 +23,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: csf/007, csf-v11/110
 Validation test: Hades hub 77 -> 92 fps at 502 MHz (DDK 87), 176 -> 205 at 1255 MHz (DDK 199); PanProbe 38/38; no GPU faults
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c | 35 ++++++++++++++++----

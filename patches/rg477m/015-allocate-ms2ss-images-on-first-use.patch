@@ -31,6 +31,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none of ours; applies on the full g615-v11-csf series
 Validation test: msrtss (64x64 RGBA8 ms2ss image; clear+draw at 4x, load+draw at 8x, load+blend at 16x, average resolve): identical pixels to the unpatched driver, edge pixels blended, 20 create/use/destroy loops stable; memory requirement 468 KiB -> 20 KiB. DOOM 3 BFG peak GPU memory 4073 -> 1237 MB, Jupiter Hell 4.2 GB (cap) -> 1022 MB; drawbench checksums 8/8 and racetest identical
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/panvk_image.c         | 206 +++++++---------------

@@ -28,6 +28,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none of ours; applies on the full g615-v11-csf series
 Validation test: PanProbe 38/38 (geometry, tessellation, xfb, gs_viewport_depth, gs_tess_primitive_id pass); drawbench 8/8, racetest and msrtss identical; peak GPU memory Megabonk 1258 -> 1180 MB, Moonlighter 793 -> 637 MB, Valheim 2054 -> 1990 MB, same fps
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c |  3 +-

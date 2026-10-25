@@ -33,6 +33,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none of ours
 Validation test: PanProbe 38/38; drawbench 8/8, racetest and msrtss identical to rg477m/016; Megabonk, Moonlighter, Valheim boot as before
+Channel: compatibility, unsafe
 Generated-by: upstream (backport, applied unchanged with git am)
 ---
  src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c | 4 +++-

@@ -20,6 +20,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none
 Validation test: DOOM 3 BFG (OpenGL via Zink in GameNative) faulted on fragment job 10 of every launch (CS_FATAL CS_BUS_FAULT, info 0xbf9a010; decoded fragment stream: MOVE48 d68, #0xFFFEE400 / CALL d68) on our builds and on zenithblue's unmodified RC2; with the fix no fault in 300 s; racetest all cases 0/100 stale, controls 100/100; drawbench image checksums identical (8 tests)
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c | 2 +-

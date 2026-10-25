@@ -43,6 +43,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: zenithblue's BC emulation (bc_gfx fragment-decode path); applies on the full g615-v11-csf series after rg477m/019
 Validation test: per-texture memory 2048x2048 with mips BC1 8.0 -> 5.3 MiB, BC3 16.0 -> 10.7, BC5 16.6 -> 11.2, BC7 10.7 -> 5.3 (bcsize); Risk of Rain 2 raw blocks 0.88 GB -> 0, reaches its main menu (peak 3.4 GB) instead of running out of memory after the intro; 15-game boot sweep with no skipped copies and no GPU faults; Arkham Asylum gameplay unchanged (24 fps, renders correctly); Gladius 2/2; default (off): PanProbe 38/38; with PANVK_BC_DROP_RAW=1: PanProbe 37/38 (bc_decode copy and blit exact for all 16 BC formats, its raw-readback check fails by design); drawbench 6 checksums and racetest 4 modes identical to the previous build
+Channel: unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/panvk_image.c       |  15 ++-

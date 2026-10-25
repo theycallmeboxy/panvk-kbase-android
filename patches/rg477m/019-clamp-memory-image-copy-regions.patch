@@ -33,6 +33,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none of ours; applies on the full g615-v11-csf series
 Validation test: Descenders faulted (CS translation fault) on every launch with rg477m/018 and now runs to the memory cap with no fault (2/2 runs, plus a debug build with an unmapped guard page under every buffer); guard-page sweep of 18 other games found no other out-of-bounds GPU access; PanProbe 38/38; drawbench 8/8 checksums, racetest 11 modes and msrtss identical
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/vulkan/panvk_vX_cmd_meta.c | 139 ++++++++++++++++++++++++

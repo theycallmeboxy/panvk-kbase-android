@@ -28,6 +28,7 @@ Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none
 Validation test: Hades Vulkan renderer 31.9 -> 48.2 fps at 502 MHz (DDK 58.4), 64.0 -> 103.1 at 1255 MHz (DDK 132.2); Hades DXVK unchanged; PanProbe 38/38; no GPU faults
+Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/lib/pan_fb.c               |  2 +-
