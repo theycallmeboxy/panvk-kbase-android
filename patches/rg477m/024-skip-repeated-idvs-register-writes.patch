@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:59:13 -0400
+Subject: [PATCH] panvk/csf: skip IDVS index buffer and VARY_SIZE writes that
+ repeat the held values
+
+Every draw wrote VARY_SIZE, and every indexed draw INDEX_BUFFER_SIZE and
+INDEX_BUFFER (a MOVE32 and a MOVE48), although they change only with the
+raster VS variant and with vkCmdBindIndexBuffer. That is 3 of the about 13
+vertex/tiler instructions of a typical DXVK indexed draw that only changed
+descriptors, each paid in cs_move*_to, the CS allocation and the CSF
+front end.
+
+Nothing but prepare_draw() writes these three registers, so remember the
+values last written at the top level of the CS and skip a write of the same
+value. The cache is per command buffer and cleared wherever the register
+state becomes unknown: command buffer reset/begin and the state reset after
+vkCmdExecuteCommands (both clear the graphics state), and CS segment cuts,
+through gfx_state_set_all_dirty(). Draws that may be recorded inside CS loops
+or conditionals never use it and leave it cleared: gpu_prerast generated
+draws, indirect draws, and anything recorded while a CS block is open. The
+values are compared, not inferred from dirty bits, so a variant change that
+sets no dirty bit can't leave a stale VARY_SIZE.
+
+The launch registers (GLOBAL_ATTRIBUTE_OFFSET, INSTANCE_*) are left alone:
+indirect and gpu_prerast paths load or patch them from the GPU.
+
+PANVK_NO_IDVS_REG_CACHE=1 writes the registers on every draw again.
+
+Effect on the CS: 1 instruction less per draw, 3 per indexed draw that keeps
+its index buffer (DXVK draws usually do).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: D2: CPU/CS per draw: skip INDEX_BUFFER, INDEX_BUFFER_SIZE and VARY_SIZE writes that repeat the values the registers already hold (value cache for top-level plain draws, cleared wherever register state becomes unknown; indirect, gpu_prerast and in-CS-block draws always write); 1 CS instruction less per draw, 3 per indexed draw that keeps its index buffer. PANVK_NO_IDVS_REG_CACHE=1 reverts
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: none; applies on the full g615-v11-csf series after rg477m/023
+Validation test: draw-path batch rg477m/023-027 on the device (drawcpu bench, DXVK pattern, 20,000 draws x 20 reps, pinned A715 at max clock, 10 interleaved runs per build): 543.6 -> 467.9 ns per recorded draw (-14%); with rg477m/024, 025 and 027 switched off (PANVK_NO_IDVS_REG_CACHE=1 PANVK_NO_SYSVAL_GATE=1 PANVK_NO_DESC_SPLIT=1) 501.8, so the three together about -7%; PanProbe 38/38 x2; Arkham Asylum (CPU-bound DXVK, quietd Stock, 10 interleaved rounds + 3) gameplay fps unchanged (median 36.4 base vs 36.55), launch failures 0/13 base vs 2/13 (known B5 signatures, Fisher p~0.48, n.s.); combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h  | 15 +++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c | 68 +++++++++++++++++----
+ src/panfrost/vulkan/panvk_cmd_draw.h        | 23 +++++++
+ 3 files changed, 95 insertions(+), 11 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index 1fd67f7a..ece1f33e 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -766,6 +766,21 @@ inherits_render_ctx(struct panvk_cmd_buffer *cmdbuf)
+ 
+ void panvk_per_arch(cmd_flush_lazy_compute)(struct panvk_cmd_buffer *cmdbuf);
+ 
++/* Draw-time IDVS register caching: the index buffer and VARY_SIZE registers
++ * are written only when the value differs from the one they hold
++ * (idvs_reg_cacheable()). PANVK_NO_IDVS_REG_CACHE=1 writes them on every draw
++ * again. */
++static inline bool
++panvk_idvs_reg_cache_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_IDVS_REG_CACHE", false);
++
++   return !disabled;
++}
++
+ /* Barrier sync elision, primary command buffers only (see emit_barrier_csf()).
+  * PANVK_NO_SYNC_ELISION=1 turns it off. */
+ static inline bool
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index bf91fcb8..7922dbe0 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -2922,16 +2922,61 @@ prepare_dcd(struct panvk_cmd_buffer *cmdbuf,
+    }
+ }
+ 
++/* Nothing but prepare_draw() writes the INDEX_BUFFER, INDEX_BUFFER_SIZE and
++ * VARY_SIZE registers, so they keep the last values written at the top level
++ * of the CS, and a draw can skip writing the same values again. Draws
++ * generated by gpu_prerast and indirect draws may be recorded inside CS loops
++ * or conditionals: they always write the registers and leave them unknown.
++ * Inside a block a skipped write could also see a value written later in the
++ * same loop, so only top-level draws use the cache. Command buffer begin,
++ * secondary execution and CS segment cuts clear it with the dirty state
++ * (gfx_state_set_all_dirty()).
++ */
++static bool
++idvs_reg_cacheable(struct cs_builder *b, const struct panvk_draw_info *draw)
++{
++   return panvk_idvs_reg_cache_enabled() && !draw->gpu_prerast_generated &&
++          !draw->indirect.buffer_dev_addr && cs_cur_block(b) == NULL;
++}
++
+ static void
+-prepare_index_buffer(struct cs_builder *b,
+-                     const struct panvk_draw_info *draw)
++prepare_index_buffer(struct panvk_cmd_buffer *cmdbuf, struct cs_builder *b,
++                     const struct panvk_draw_info *draw, bool cacheable)
+ {
+-   if (draw->index.index_size) {
+-      cs_move32_to(b, cs_sr_reg32(b, IDVS, INDEX_BUFFER_SIZE),
+-                   draw->index.buffer_size);
+-      cs_move64_to(b, cs_sr_reg64(b, IDVS, INDEX_BUFFER),
+-                   draw->index.buffer_dev_addr);
+-   }
++   if (!draw->index.index_size)
++      return;
++
++   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
++   const uint64_t addr = draw->index.buffer_dev_addr;
++   const uint32_t size = (uint32_t)draw->index.buffer_size;
++
++   if (cacheable && gfx->idvs_regs.ib_valid &&
++       gfx->idvs_regs.ib_addr == addr && gfx->idvs_regs.ib_size == size)
++      return;
++
++   cs_move32_to(b, cs_sr_reg32(b, IDVS, INDEX_BUFFER_SIZE), size);
++   cs_move64_to(b, cs_sr_reg64(b, IDVS, INDEX_BUFFER), addr);
++
++   gfx->idvs_regs.ib_addr = addr;
++   gfx->idvs_regs.ib_size = size;
++   gfx->idvs_regs.ib_valid = cacheable;
++}
++
++static void
++prepare_vary_size(struct panvk_cmd_buffer *cmdbuf, struct cs_builder *b,
++                  const struct panvk_shader_variant *vs, bool cacheable)
++{
++   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
++   const uint32_t vary_size = vs->info.varyings.formats.generic_size_B;
++
++   if (cacheable && gfx->idvs_regs.vary_size_valid &&
++       gfx->idvs_regs.vary_size == vary_size)
++      return;
++
++   cs_move32_to(b, cs_sr_reg32(b, IDVS, VARY_SIZE), vary_size);
++
++   gfx->idvs_regs.vary_size = vary_size;
++   gfx->idvs_regs.vary_size_valid = cacheable;
+ }
+ 
+ static void
+@@ -3132,12 +3177,13 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf,
+    prepare_fs(cmdbuf, fs);
+ 
+    cs_update_vt_ctx(b) {
+-      prepare_index_buffer(b, draw);
++      const bool idvs_cacheable = idvs_reg_cacheable(b, draw);
++
++      prepare_index_buffer(cmdbuf, b, draw, idvs_cacheable);
+ 
+       set_tiler_idvs_flags(b, cmdbuf, draw);
+ 
+-      cs_move32_to(b, cs_sr_reg32(b, IDVS, VARY_SIZE),
+-                   vs->info.varyings.formats.generic_size_B);
++      prepare_vary_size(cmdbuf, b, vs, idvs_cacheable);
+ 
+       struct pan_earlyzs_state earlyzs = {0};
+ 
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index f6d6a2d0..40f57acb 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -252,6 +252,20 @@ struct panvk_cmd_graphics_state {
+       uint8_t index_size;
+    } ib;
+ 
++#if PAN_ARCH >= 10
++   /* What the IDVS INDEX_BUFFER, INDEX_BUFFER_SIZE and VARY_SIZE registers
++    * hold, when known (see idvs_reg_cacheable()). Cleared with the dirty
++    * state wherever the register state becomes unknown.
++    */
++   struct {
++      uint64_t ib_addr;
++      uint32_t ib_size;
++      uint32_t vary_size;
++      bool ib_valid;
++      bool vary_size_valid;
++   } idvs_regs;
++#endif
++
+    struct {
+       struct panvk_blend_info info;
+    } cb;
+@@ -303,8 +317,17 @@ panvk_prerast_viewport_shader(const struct panvk_cmd_graphics_state *gfx)
+ #define gfx_state_clear_all_dirty(__cmdbuf)                                    \
+    BITSET_ZERO((__cmdbuf)->state.gfx.dirty)
+ 
++#if PAN_ARCH >= 10
++#define gfx_state_set_all_dirty(__cmdbuf)                                      \
++   do {                                                                        \
++      BITSET_ONES((__cmdbuf)->state.gfx.dirty);                                \
++      (__cmdbuf)->state.gfx.idvs_regs.ib_valid = false;                        \
++      (__cmdbuf)->state.gfx.idvs_regs.vary_size_valid = false;                 \
++   } while (0)
++#else
+ #define gfx_state_set_all_dirty(__cmdbuf)                                      \
+    BITSET_ONES((__cmdbuf)->state.gfx.dirty)
++#endif
+ 
+ #define set_gfx_sysval(__cmdbuf, __dirty, __name, __val)                       \
+    do {                                                                        \
+-- 
+2.55.0
+
