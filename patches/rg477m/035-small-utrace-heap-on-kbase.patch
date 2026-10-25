@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: abhay-byte <zenithblue.dev@gmail.com>
+Date: Sat, 24 Oct 2026 00:31:28 +0000
+Subject: [PATCH] panvk/csf: 64 KiB u_trace heap on kbase without
+ MESA_GPU_TRACES
+
+Rationale: the u_trace timestamp/clone heap (PANVK_UTRACE_CLONE_MEM_SIZE,
+10 MiB) is committed at device creation, but on kbase the submit path never
+processes u_trace (process_utrace = false), so without MESA_GPU_TRACES the
+heap is never used (fo4-memory-analysis section 2.9, fix 8).
+
+On kbase with MESA_GPU_TRACES unset the default is 64 KiB. With
+MESA_GPU_TRACES set, or on panthor, it stays 10 MiB.
+
+Knob: PANVK_UTRACE_CLONE_MEM_SIZE=0xa00000 = old. Expected gain: 10 MiB of
+committed memory per device. Arch: v10+ kbase.
+
+Port of zenithblue csf-v11/228: applies unchanged on the RC3-lowmem + rg477m base (memport).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Purpose: M1 (228): on kbase the submit path never processes u_trace, so the 10 MiB timestamp/clone heap is 64 KiB unless MESA_GPU_TRACES is set: 9.94 MiB less per VkDevice. PANVK_UTRACE_CLONE_MEM_SIZE=0xa00000 reverts
+Upstream-commit: zenithblue csf-v11/228 (port)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/032 (panvk_priv_bo_create_kind); applies on the full g615-v11-csf series after rg477m/034 (csf-v11/228 applies unchanged)
+Validation test: built OK at this commit on memport (bld.sh, 0 new warnings) and at next tip 7390330e in compat and unsafe; combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_utrace.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_utrace.c b/src/panfrost/vulkan/csf/panvk_vX_utrace.c
+index 0a17bf3a..db9aada7 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_utrace.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_utrace.c
+@@ -171,10 +171,18 @@ panvk_utrace_capture_data(struct u_trace *ut, void *cs, void *dst_buffer,
+                     cs_info->capture_data_wait_for_ts);
+ }
+ 
++/* csf-v11 228: on kbase u_trace is never processed (the submit path clears
++ * process_utrace), so without MESA_GPU_TRACES the 10 MiB heap (u_trace
++ * timestamp and clone buffers) was committed for nothing. Then kbase gets
++ * 64 KiB, unless PANVK_UTRACE_CLONE_MEM_SIZE is set (0xa00000 = old). */
+ static uint32_t
+-get_utrace_clone_mem_size()
++get_utrace_clone_mem_size(const struct panvk_device *dev)
+ {
+-   return debug_get_num_option("PANVK_UTRACE_CLONE_MEM_SIZE", 0xa00000);
++   const bool small =
++      to_panvk_physical_device(dev->vk.physical)->kbase_node_path[0] != '\0' &&
++      !os_get_option("MESA_GPU_TRACES");
++   return debug_get_num_option("PANVK_UTRACE_CLONE_MEM_SIZE",
++                               small ? 0x10000 : 0xa00000);
+ }
+ 
+ VkResult
+@@ -188,7 +196,7 @@ panvk_per_arch(utrace_context_init)(struct panvk_device *dev)
+                         panvk_utrace_delete_flush_data);
+ 
+    VkResult result = panvk_priv_bo_create_kind(
+-      dev, get_utrace_clone_mem_size(), 0, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT,
++      dev, get_utrace_clone_mem_size(dev), 0, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT,
+       &dev->utrace.copy_buf_heap_bo, PANVK_MEM_UTRACE);
+    if (result != VK_SUCCESS) {
+       u_trace_context_fini(&dev->utrace.utctx);
+-- 
+2.55.0
+
