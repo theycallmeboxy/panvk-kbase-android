@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: abhay-byte <zenithblue.dev@gmail.com>
+Date: Sat, 24 Oct 2026 00:30:38 +0000
+Subject: [PATCH] panvk/csf: free outgrown device TLS BOs once no command
+ buffer uses them
+
+Rationale: csf-v11 097 shares one device TLS BO between command buffers,
+but kept every outgrown (smaller) BO until device destroy, up to about 2x
+the peak size (fo4-memory-analysis section 2.7, fix 6).
+
+Each command buffer now holds a reference on the device TLS BO its TLS
+descriptors point at (released at reset or free, when it can no longer be
+pending), and the device keeps only the largest BO. An outgrown BO is freed
+when the last command buffer that used it is reset. Bytes retired this way
+are counted in PANVK_DEBUG=mem ("tls_freed=").
+
+Knob: PANVK_TLS_FREE_OLD=0 = old. Arch: v10+ (CSF).
+
+Port of zenithblue csf-v11/227 onto the RC3-lowmem + rg477m base
+(memport): the reset/destroy hunks are placed by hand (this base has no
+BC raw refs or BC timing arrays in the command buffer); dev_tls_refs sits
+after vmr_segs and is zero-initialised by vk_zalloc like it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Purpose: M4 (227): each command buffer refs the device TLS BO it used (released at reset/destroy), and the device keeps only the largest, so TLS BOs outgrown by spilling shaders are freed once no command buffer can still use them (before: up to ~2x the peak alive). Port: command-buffer struct/reset/destroy hunks placed by hand. PANVK_TLS_FREE_OLD=0 reverts
+Upstream-commit: zenithblue csf-v11/227 (port)
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/032 (counter); applies on the full g615-v11-csf series after rg477m/033
+Validation test: built OK at this commit on memport (bld.sh, 0 new warnings) and at next tip 7390330e in compat and unsafe; combined build next.so (15c3385bbe40, rg477m/023-037): PanProbe 38/38 x2 (unsafe profile 37/38, only the bc_decode raw readback, by design); 16-game boot sweep 2026-10-25 in quietd Stock mode: Hades 60, Jupiter Hell 59, Risk of Rain 2 38, Moonlighter 60, Megabonk 60, Portal 2 60, Gladius 60, Crysis 3 Remastered 60 fps; Arkham Asylum to the menu; Factorio and Ashes menus render as before; Descenders, Tomb Raider, Doom 3 BFG and Metro 2033 match their known states; 0 GPU faults; Serious Sam bot benchmark A-B-B-A compat 49.2/52.7 vs next 53.3/51.1 fps; Arkham Asylum 20-round interleaved A/B 2026-10-25 (quietd Stock), base rg477m vs next: launch failures 1/20 vs 0/20 (session total 1/33 vs 4/36, not significant; B5 signatures also seen on the stock driver), gameplay fps median 36.4 vs 36.5, speckcount on 3 gameplay frames per run 0-1 px in both arms (base 2 runs with 1 px, next 3 runs with 1 px; the old specks bug gave tens to hundreds): no specks
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h    |  5 ++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 50 ++++++++++++++++++-
+ 2 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index 36f8c026..ec996fa2 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -690,6 +690,11 @@ struct panvk_cmd_buffer {
+     * segments; the builders hold the last one, with gfx.render.vmr_samples.
+     */
+    struct util_dynarray vmr_segs;
++
++   /* csf-v11 227: device TLS BOs (struct panvk_priv_bo *) this command
++    * buffer's TLS descriptors point at, released when it is reset or
++    * freed, so outgrown device TLS BOs can go. */
++   struct util_dynarray dev_tls_refs;
+ };
+ 
+ struct panvk_vmr_segment {
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index 9b181fdc..78066922 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -87,10 +87,33 @@ panvk_per_arch(kbase_mark_progress)(
+  * for Speed Most Wanted (1.7 GiB, then Android killed apps).
+  * ponytail: outgrown BOs live until device destroy (<= 2x the peak size);
+  * refcount them per command buffer if that ever matters. */
++/* csf-v11 227: PANVK_TLS_FREE_OLD=0 keeps every outgrown device TLS BO
++ * until device destroy (old). By default each command buffer holds a
++ * reference on the device TLS BO it uses, and the device keeps only the
++ * largest one, so an outgrown BO goes when the last command buffer that
++ * used it is reset or freed (it can no longer be pending then). */
++static bool
++dev_tls_free_old(void)
++{
++   static int v = -1;
++   if (p_atomic_read(&v) < 0)
++      p_atomic_set(&v, debug_get_bool_option("PANVK_TLS_FREE_OLD", true));
++   return p_atomic_read(&v);
++}
++
++static void
++dev_tls_release(struct panvk_cmd_buffer *cmdbuf)
++{
++   util_dynarray_foreach(&cmdbuf->dev_tls_refs, struct panvk_priv_bo *, bo)
++      panvk_priv_bo_unref(*bo);
++   util_dynarray_clear(&cmdbuf->dev_tls_refs);
++}
++
+ static uint64_t
+ get_device_tls(struct panvk_cmd_buffer *cmdbuf, uint64_t size)
+ {
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
++   const bool free_old = dev_tls_free_old();
+    uint64_t addr = 0;
+ 
+    simple_mtx_lock(&dev->tls.lock);
+@@ -106,6 +129,16 @@ get_device_tls(struct panvk_cmd_buffer *cmdbuf, uint64_t size)
+              panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_NO_MMAP),
+              VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &bo,
+              PANVK_MEM_DEV_TLS) == VK_SUCCESS) {
++         if (free_old) {
++            /* Drop the device's references on the outgrown BOs; command
++             * buffers that use them hold their own. */
++            util_dynarray_foreach(&dev->tls.bos, struct panvk_priv_bo *, old) {
++               p_atomic_add(&panvk_mem_stats.dev_tls_freed_B,
++                            pan_kmod_bo_size((*old)->bo));
++               panvk_priv_bo_unref(*old);
++            }
++            util_dynarray_clear(&dev->tls.bos);
++         }
+          util_dynarray_append(&dev->tls.bos, bo);
+          cur = bo;
+       } else {
+@@ -113,8 +146,18 @@ get_device_tls(struct panvk_cmd_buffer *cmdbuf, uint64_t size)
+       }
+    }
+ 
+-   if (cur)
++   if (cur) {
+       addr = cur->addr.dev;
++      if (free_old) {
++         bool held = false;
++         util_dynarray_foreach(&cmdbuf->dev_tls_refs, struct panvk_priv_bo *,
++                               r)
++            held = held || *r == cur;
++         if (!held)
++            util_dynarray_append(&cmdbuf->dev_tls_refs,
++                                 panvk_priv_bo_ref(cur));
++      }
++   }
+    simple_mtx_unlock(&dev->tls.lock);
+ 
+    if (!addr)
+@@ -1408,6 +1451,9 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
+ 
+    vk_command_buffer_reset(&cmdbuf->vk);
+ 
++   /* Not pending any more: the device TLS BOs it used can go. */
++   dev_tls_release(cmdbuf);
++
+    panvk_pool_reset(&cmdbuf->cs_pool);
+    panvk_pool_reset(&cmdbuf->desc_pool);
+    panvk_pool_reset(&cmdbuf->tls_pool);
+@@ -1443,6 +1489,8 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
+    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++)
+       cs_builder_fini(&cmdbuf->state.cs[i].builder);
+ 
++   dev_tls_release(cmdbuf);
++   util_dynarray_fini(&cmdbuf->dev_tls_refs);
+    util_dynarray_fini(&cmdbuf->vmr_segs);
+    panvk_pool_cleanup(&cmdbuf->cs_pool);
+    panvk_pool_cleanup(&cmdbuf->desc_pool);
+-- 
+2.55.0
+
