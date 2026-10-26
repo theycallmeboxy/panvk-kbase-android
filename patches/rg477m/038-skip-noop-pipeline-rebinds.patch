@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 04:56:09 -0400
+Subject: [PATCH] panvk/csf: skip graphics pipeline rebinds that would change
+ nothing
+
+DXVK 1.10 calls vkCmdBindPipeline whenever its pipeline state is dirty,
+without comparing the handle, so many binds rebind the pipeline already
+bound. vk_graphics_pipeline_cmd_bind() then walks every stage and
+vk_dynamic_graphics_state_copy() compares every static state of the
+pipeline against the command buffer's (about 100 branches): with
+vk_graphics_pipeline_cmd_bind, 7.4% of PanVK's CPU samples in the Arkham
+profile, for binds that change nothing.
+
+vkCmdBindPipeline(GRAPHICS) now goes through a per-arch CmdBindPipeline.
+It returns without binding when the pipeline is the one its last real
+bind bound, every graphics shader pointer and the runtime's graphics
+pipeline stage mask are still what that bind left, and no state the
+pipeline has as static changed value since. Then the bind would change
+nothing: the shader bind would compare equal pointers and the copy equal
+values, so neither dirty bits nor any value differ from a real bind.
+
+"Changed value since" comes from a new runtime bitset,
+vk_dynamic_graphics_state::written, set next to dirty wherever the
+runtime records a value change (SET_DYN_VALUE/ARRAY, the copy's
+newly-set states, vkCmdSetVertexInputEXT) and never cleared by the
+runtime. PanVK clears it after each real bind. Unlike dirty it isn't
+cleared per draw, and a state already dirty still records a write, so it
+covers vkCmdSet*() of a static state followed by a rebind, a pipeline
+with that state dynamic bound in between (the handle differs) and
+vk_meta (its pipeline bind replaces the last bound pipeline; its restore
+copies the saved values and the matching written bits back). The static
+state set comes from a new vk_graphics_pipeline_get_bind_state(); for
+pipelines it returns NULL for, every bind runs. Reset and
+vkCmdExecuteCommands zero the tracking with the rest of the graphics
+state.
+
+Compatibility channel. PANVK_NO_REBIND_SKIP=1 runs every bind again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: CPU: vkCmdBindPipeline(GRAPHICS) of the pipeline already bound, with no static state written since, returns before the runtime's per-stage bind and dynamic-state copy (7.4% of driver CPU samples in Arkham); PANVK_NO_REBIND_SKIP=1 disables
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: shared runtime vk_pipeline.c/h and vk_graphics_state.c/h (+37 lines: written bitset, vk_graphics_pipeline_get_bind_state); applies after rg477m/037
+Validation test: drawcpu dxvk pattern (same pipeline 15 of 16 draws) 470 -> 322 ns/draw (-31%), no-bind control unchanged; PanProbe 38/38 x2; Arkham Asylum 12,015 no-op rebinds/s skipped (~0.2% of a core), Hades 0; combined build d6.so (443dfbaf1028, rg477m/023-041): 16-game boot sweep 2026-10-25 in quietd Stock mode (boot check, FPS limiter on): all 16 boot to their known states (Hades, Arkham, Serious Sam, Jupiter Hell, Risk of Rain 2, Moonlighter, Megabonk, Portal 2, Gladius, Crysis 3 Remastered render; Factorio and Ashes menus; Descenders; Tomb Raider ToS screen; Doom 3 BFG white window; Metro 2033 black), 0 GPU faults; uncapped gameplay A-B-B-A vs compat (quietd Stock, FPS limiter off): Hades hub at 1255 MHz 224.7 vs 224.9 fps (n=4 each, GPU-bound), Jupiter Hell tutorial level 48.5 vs 48.6 fps (n=4 each), Serious Sam bot benchmark D3D11 57.0 vs 58.9 fps (n=2 each), Risk of Rain 2 stage 1 27.6 vs 28.8 fps (n=5 each, random maps; the B17 memory guard ended 1 of 6 runs in each arm); Arkham Asylum 20-round interleaved gameplay gate 2026-10-25/26 (quietd Stock, FPS limiter off), base rg477m/023-037 vs this: gameplay fps 36.24 vs 36.25 (n=17 each), load failures (B5 signatures: appUncompressMemory/BulkData assertions, pure-virtual dialog) 2/19 vs 3/20 (B5 base rate: stock 7/38, ours 16/138), 0 GPU faults
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c | 83 +++++++++++++++++++
+ src/panfrost/vulkan/panvk_cmd_draw.h          | 12 +++
+ src/vulkan/runtime/vk_graphics_state.c        |  5 ++
+ src/vulkan/runtime/vk_graphics_state.h        |  9 ++
+ src/vulkan/runtime/vk_pipeline.c              | 13 +++
+ src/vulkan/runtime/vk_pipeline.h              | 10 +++
+ 6 files changed, 132 insertions(+)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index 78066922..842bc996 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -37,7 +37,9 @@
+ #include "pan_samples.h"
+ 
+ #include "util/bitscan.h"
++#include "vk_common_entrypoints.h"
+ #include "vk_descriptor_update_template.h"
++#include "vk_pipeline.h"
+ #include "vk_format.h"
+ #include "vk_synchronization.h"
+ 
+@@ -1264,6 +1266,87 @@ panvk_per_arch(cmd_flush_lazy_vt_wait)(struct panvk_cmd_buffer *cmdbuf)
+                       cs_scratch_reg_tuple(b, 0, 4));
+ }
+ 
++/* DXVK binds the graphics pipeline whenever its pipeline state is dirty,
++ * without checking whether the handle changed, so many binds rebind the
++ * pipeline already bound. Such a rebind changes nothing when no shader
++ * changed since the last bind and no state the pipeline has as static was
++ * written since: the shader bind then compares equal pointers and
++ * vk_dynamic_graphics_state_copy() equal values, at about 100 branches per
++ * bind. The written bitset (set on every value change, cleared here after
++ * each real bind) says whether such a state was written, in any order with
++ * other binds, vk_meta or vkCmdSet*() calls: a value change anywhere sets
++ * it. PANVK_NO_REBIND_SKIP=1 runs every bind.
++ */
++static bool
++rebind_skip_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_REBIND_SKIP", false);
++
++   return !disabled;
++}
++
++#define REBIND_GFX_STAGES                                                     \
++   (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |              \
++    VK_SHADER_STAGE_MESH_BIT_EXT)
++
++static void
++cmd_bind_gfx_pipeline(struct panvk_cmd_buffer *cmdbuf,
++                      VkPipeline _pipeline)
++{
++   VK_FROM_HANDLE(vk_pipeline, pipeline, _pipeline);
++   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
++   struct vk_dynamic_graphics_state *dyn = &cmdbuf->vk.dynamic_graphics_state;
++   const struct vk_dynamic_graphics_state *bind_state =
++      vk_graphics_pipeline_get_bind_state(pipeline);
++
++   if (bind_state != NULL && gfx->bound_pipeline.pipeline == pipeline &&
++       gfx->bound_pipeline.vs == gfx->vs.shader &&
++       gfx->bound_pipeline.fs == gfx->fs.shader &&
++       gfx->bound_pipeline.gs == gfx->gs.shader &&
++       gfx->bound_pipeline.tcs == gfx->tcs.shader &&
++       gfx->bound_pipeline.tes == gfx->tes.shader &&
++       gfx->bound_pipeline.stages ==
++          (cmdbuf->vk.pipeline_shader_stages & REBIND_GFX_STAGES)) {
++      BITSET_DECLARE(overwritten, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
++
++      BITSET_AND(overwritten, dyn->written, bind_state->set);
++      if (BITSET_IS_EMPTY(overwritten))
++         return;
++   }
++
++   vk_common_CmdBindPipeline(panvk_cmd_buffer_to_handle(cmdbuf),
++                             VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
++
++   BITSET_ZERO(dyn->written);
++   gfx->bound_pipeline.pipeline = bind_state != NULL ? pipeline : NULL;
++   gfx->bound_pipeline.vs = gfx->vs.shader;
++   gfx->bound_pipeline.fs = gfx->fs.shader;
++   gfx->bound_pipeline.gs = gfx->gs.shader;
++   gfx->bound_pipeline.tcs = gfx->tcs.shader;
++   gfx->bound_pipeline.tes = gfx->tes.shader;
++   gfx->bound_pipeline.stages =
++      cmdbuf->vk.pipeline_shader_stages & REBIND_GFX_STAGES;
++}
++
++VKAPI_ATTR void VKAPI_CALL
++panvk_per_arch(CmdBindPipeline)(VkCommandBuffer commandBuffer,
++                                VkPipelineBindPoint pipelineBindPoint,
++                                VkPipeline _pipeline)
++{
++   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++
++   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS &&
++       rebind_skip_enabled()) {
++      cmd_bind_gfx_pipeline(cmdbuf, _pipeline);
++      return;
++   }
++
++   vk_common_CmdBindPipeline(commandBuffer, pipelineBindPoint, _pipeline);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+                                     const VkDependencyInfo *pDependencyInfo)
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index d32abf43..ac9db488 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -272,6 +272,18 @@ struct panvk_cmd_graphics_state {
+       bool ib_valid;
+       bool vary_size_valid;
+    } idvs_regs;
++
++   /* The graphics pipeline last bound with vkCmdBindPipeline() and the
++    * shaders its bind left bound, for skipping rebinds that would change
++    * nothing (see panvk_per_arch(CmdBindPipeline)). A NULL pipeline means
++    * the next bind is never skipped. Zeroed with the rest of the graphics
++    * state on reset and by vkCmdExecuteCommands().
++    */
++   struct {
++      const struct vk_pipeline *pipeline;
++      const struct panvk_shader *vs, *fs, *gs, *tcs, *tes;
++      VkShaderStageFlags stages;
++   } bound_pipeline;
+ #endif
+ 
+    struct {
+diff --git a/src/vulkan/runtime/vk_graphics_state.c b/src/vulkan/runtime/vk_graphics_state.c
+index 6f6f0fca..7c3a3f3b 100644
+--- a/src/vulkan/runtime/vk_graphics_state.c
++++ b/src/vulkan/runtime/vk_graphics_state.c
+@@ -2165,6 +2165,7 @@ vk_dynamic_graphics_state_fill(struct vk_dynamic_graphics_state *dyn,
+       assert((dst)->state == (value));                      \
+       BITSET_SET(dst->set, MESA_VK_DYNAMIC_##STATE);        \
+       BITSET_SET(dst->dirty, MESA_VK_DYNAMIC_##STATE);      \
++      BITSET_SET(dst->written, MESA_VK_DYNAMIC_##STATE);    \
+    }                                                        \
+ } while(0)
+ 
+@@ -2180,6 +2181,7 @@ vk_dynamic_graphics_state_fill(struct vk_dynamic_graphics_state *dyn,
+       memcpy((dst)->state + start, src, __state_size);            \
+       BITSET_SET(dst->set, MESA_VK_DYNAMIC_##STATE);              \
+       BITSET_SET(dst->dirty, MESA_VK_DYNAMIC_##STATE);            \
++      BITSET_SET(dst->written, MESA_VK_DYNAMIC_##STATE);          \
+    }                                                              \
+ } while(0)
+ 
+@@ -2411,6 +2413,7 @@ vk_dynamic_graphics_state_copy(struct vk_dynamic_graphics_state *dst,
+        * the value from src.
+        */
+       dst->dirty[w] |= src->set[w] & ~dst->set[w];
++      dst->written[w] |= src->set[w] & ~dst->set[w];
+ 
+       /* Everything that was in the source is now in the destination */
+       dst->set[w] |= src->set[w];
+@@ -2477,6 +2480,8 @@ vk_common_CmdSetVertexInputEXT(VkCommandBuffer commandBuffer,
+    BITSET_SET(dyn->set, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
+    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_VI);
+    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
++   BITSET_SET(dyn->written, MESA_VK_DYNAMIC_VI);
++   BITSET_SET(dyn->written, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
+ }
+ 
+ void
+diff --git a/src/vulkan/runtime/vk_graphics_state.h b/src/vulkan/runtime/vk_graphics_state.h
+index 1db6dd53..91d1a530 100644
+--- a/src/vulkan/runtime/vk_graphics_state.h
++++ b/src/vulkan/runtime/vk_graphics_state.h
+@@ -987,6 +987,15 @@ struct vk_dynamic_graphics_state {
+ 
+    /** For command buffers, which bits of dynamic state have changed */
+    BITSET_DECLARE(dirty, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
++
++   /** For command buffers, which bits of dynamic state have changed value
++    *
++    * Set wherever dirty is set for a value change, but never cleared by the
++    * runtime: the driver clears it when it wants to know which state was
++    * written after some point, for instance whether a rebind of the pipeline
++    * last bound would change anything.
++    */
++   BITSET_DECLARE(written, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
+ };
+ 
+ /***/
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index d134e226..320e259b 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -2013,6 +2013,19 @@ static const struct vk_pipeline_ops vk_graphics_pipeline_ops = {
+    .get_shader = vk_graphics_pipeline_get_shader,
+ };
+ 
++const struct vk_dynamic_graphics_state *
++vk_graphics_pipeline_get_bind_state(const struct vk_pipeline *pipeline)
++{
++   if (pipeline->ops != &vk_graphics_pipeline_ops ||
++       (pipeline->flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR))
++      return NULL;
++
++   const struct vk_graphics_pipeline *gfx_pipeline =
++      container_of(pipeline, struct vk_graphics_pipeline, base);
++
++   return &gfx_pipeline->linked.dynamic;
++}
++
+ static VkResult
+ vk_create_graphics_pipeline(struct vk_device *device,
+                             struct vk_pipeline_cache *cache,
+diff --git a/src/vulkan/runtime/vk_pipeline.h b/src/vulkan/runtime/vk_pipeline.h
+index 3c7cafd7..e2ecbc16 100644
+--- a/src/vulkan/runtime/vk_pipeline.h
++++ b/src/vulkan/runtime/vk_pipeline.h
+@@ -35,6 +35,7 @@ struct nir_shader_compiler_options;
+ struct spirv_to_nir_options;
+ struct vk_command_buffer;
+ struct vk_device;
++struct vk_dynamic_graphics_state;
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -226,6 +227,15 @@ vk_pipeline_get_shader(struct vk_pipeline *pipeline,
+    return pipeline->ops->get_shader(pipeline, stage);
+ }
+ 
++/** The state vkCmdBindPipeline() applies for a linked graphics pipeline
++ *
++ * Its set bits are the states the pipeline has as static, which a bind
++ * writes into the command buffer's dynamic state. NULL for pipelines not
++ * created by the common graphics pipeline code and for libraries.
++ */
++const struct vk_dynamic_graphics_state *
++vk_graphics_pipeline_get_bind_state(const struct vk_pipeline *pipeline);
++
+ void
+ vk_cmd_unbind_pipelines_for_stages(struct vk_command_buffer *cmd_buffer,
+                                    VkShaderStageFlags stages);
+-- 
+2.55.0
+
