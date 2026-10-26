@@ -1,0 +1,438 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 13:22:28 -0400
+Subject: [PATCH] panvk/csf: rebuild only the moved dynamic buffers on a
+ same-set rebind
+
+vkCmdBindDescriptorSets flagged DESC_STATE for every graphics bind, so the
+next draw re-packed both stages' driver sets (VS: 16 vertex attributes, the
+dummy sampler, the dynamic and vertex buffers; FS: varying attributes,
+sampler, dynamic buffers) and resource tables. DXVK rebinds the set it
+already bound with new dynamic offsets whenever only constant-buffer
+offsets change: in Arkham Asylum (DXVK 1.10.3, D3D9) 41,303 of 56,331 binds
+per second.
+
+On v10+ dynamic buffers are BUFFER descriptors in the stage's driver set,
+and resource table entry 0 points at the driver set; the other entries hold
+each set's descriptor memory. If every set of a bind is the one already
+bound (same handle, still with the layout and descriptor memory it was
+bound with), the bind now updates the descriptor state exactly as before
+but records which dynamic buffers moved and flags DYN_OFFSETS instead of
+DESC_STATE. A bind that changes nothing flags nothing. At the draw:
+
+- A stage that reads none of the moved buffers keeps its tables and SRT
+  register: nothing they hold changed. With DXVK's D3D9 layout a VS-only
+  constant change no longer touches the FS tables, and the reverse.
+- A stage that reads one, with none of its other dirty conditions, copies
+  its previous driver set, repacks only its dynamic-buffer descriptors,
+  copies its previous resource table and points entry 0 at the new driver
+  set: the same bytes a full rebuild would write, without the attribute and
+  varying packing and format lookups.
+- Repeated (indirect, GPU-patched) VS tables, or any other dirty condition,
+  take the full rebuild as before.
+
+PANVK_NO_DYNOFF_FAST=1 flags DESC_STATE on every graphics bind again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: CPU: a descriptor-set rebind of the same sets that only moves dynamic offsets repacks just the moved dynamic-buffer descriptors, and only in stages that read them (Arkham: 41,303 of 56,331 binds/s); PANVK_NO_DYNOFF_FAST=1 disables
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/040 (stacked); v10+
+Validation test: drawcpu arkham mix with rg477m/040 667.4 -> 646.9 ns/draw (-3.1%), dxvk pattern -5.1%; DC_CHECKSUM colour identical on/off/base; PanProbe 38/38 x2; combined build d6.so (443dfbaf1028, rg477m/023-041): 16-game boot sweep 2026-10-25 in quietd Stock mode (boot check, FPS limiter on): all 16 boot to their known states (Hades, Arkham, Serious Sam, Jupiter Hell, Risk of Rain 2, Moonlighter, Megabonk, Portal 2, Gladius, Crysis 3 Remastered render; Factorio and Ashes menus; Descenders; Tomb Raider ToS screen; Doom 3 BFG white window; Metro 2033 black), 0 GPU faults; uncapped gameplay A-B-B-A vs compat (quietd Stock, FPS limiter off): Hades hub at 1255 MHz 224.7 vs 224.9 fps (n=4 each, GPU-bound), Jupiter Hell tutorial level 48.5 vs 48.6 fps (n=4 each), Serious Sam bot benchmark D3D11 57.0 vs 58.9 fps (n=2 each), Risk of Rain 2 stage 1 27.6 vs 28.8 fps (n=5 each, random maps; the B17 memory guard ended 1 of 6 runs in each arm); Arkham Asylum 20-round interleaved gameplay gate 2026-10-25/26 (quietd Stock, FPS limiter off), base rg477m/023-037 vs this: gameplay fps 36.24 vs 36.25 (n=17 each), load failures (B5 signatures: appUncompressMemory/BulkData assertions, pure-virtual dialog) 2/19 vs 3/20 (B5 base rate: stock 7/38, ours 16/138), 0 GPU faults
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h    |  15 ++
+ .../vulkan/csf/panvk_vX_cmd_dispatch.c        |   1 +
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   | 131 +++++++++++++++++-
+ src/panfrost/vulkan/panvk_cmd_desc_state.h    |  15 ++
+ src/panfrost/vulkan/panvk_cmd_draw.h          |   4 +
+ src/panfrost/vulkan/panvk_vX_cmd_desc_state.c |  77 +++++++++-
+ 6 files changed, 234 insertions(+), 9 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index 41132d25..4a321536 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -816,6 +816,21 @@ panvk_pc_same_skip_enabled(void)
+    return !disabled;
+ }
+ 
++/* vkCmdBindDescriptorSets rebinding the bound graphics sets with only new
++ * dynamic offsets flags DYN_OFFSETS instead of DESC_STATE: the next draw
++ * rebuilds only the stages reading a moved dynamic buffer, by patching their
++ * previous tables. PANVK_NO_DYNOFF_FAST=1 flags DESC_STATE again. */
++static inline bool
++panvk_dynoff_fast_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_DYNOFF_FAST", false);
++
++   return !disabled;
++}
++
+ /* Barrier sync elision, primary command buffers only (see emit_barrier_csf()).
+  * PANVK_NO_SYNC_ELISION=1 turns it off. */
+ static inline bool
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c
+index 5985d99a..f1bf2875 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_dispatch.c
+@@ -130,6 +130,7 @@ prepare_driver_set(struct panvk_cmd_buffer *cmdbuf)
+                                      (struct mali_buffer_packed *)(&descs[1]));
+ 
+    cs_desc_state->driver_set.dev_addr = driver_set.gpu;
++   cs_desc_state->driver_set.cpu = driver_set.cpu;
+    cs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+    compute_state_set_dirty(cmdbuf, DESC_STATE);
+    return VK_SUCCESS;
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index e95e2e7e..39da551b 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -411,6 +411,7 @@ prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf, uint32_t repeat_count)
+    }
+ 
+    vs_desc_state->driver_set.dev_addr = driver_set.gpu;
++   vs_desc_state->driver_set.cpu = driver_set.cpu;
+    vs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+    if (panvk_desc_split_enabled())
+       gfx_state_set_dirty(cmdbuf, VS_SRT);
+@@ -419,6 +420,86 @@ prepare_vs_driver_set(struct panvk_cmd_buffer *cmdbuf, uint32_t repeat_count)
+    return VK_SUCCESS;
+ }
+ 
++/* A same-set rebind moved a dynamic buffer the stage reads (DYN_OFFSETS,
++ * see gfx_rebind_sets_dyn_offsets()). */
++static bool
++stage_dyn_offs_dirty(const struct panvk_cmd_buffer *cmdbuf,
++                     const struct panvk_shader_desc_info *desc_info)
++{
++   if (!gfx_state_dirty(cmdbuf, DYN_OFFSETS))
++      return false;
++
++   const struct panvk_descriptor_state *desc_state =
++      &cmdbuf->state.gfx.desc_state;
++
++   for (uint32_t i = 0; i < desc_info->dyn_bufs.count; i++) {
++      uint32_t handle = desc_info->dyn_bufs.map[i];
++      uint32_t set_idx = COPY_DESC_HANDLE_EXTRACT_TABLE(handle);
++      uint32_t dyn_buf_idx = COPY_DESC_HANDLE_EXTRACT_INDEX(handle);
++
++      if (desc_state->dyn_offs_changed[set_idx] & BITFIELD_BIT(dyn_buf_idx))
++         return true;
++   }
++
++   return false;
++}
++
++/* Rebuild a stage's driver set and resource table when only its dynamic
++ * buffers moved: the caller checked that none of the stage's other dirty
++ * conditions hold, so everything else in the previous tables is what a full
++ * rebuild would write again. Copy the previous driver set, repack its
++ * dynamic buffer descriptors (at dyn_first), copy the previous resource
++ * table and point its first entry at the new driver set. The set entries
++ * stay valid: the rebind kept every set (gfx_rebind_sets_dyn_offsets()).
++ * Returns VK_INCOMPLETE, having done nothing, if there are no single-copy
++ * previous tables to start from.
++ */
++static VkResult
++stage_patch_dyn_bufs(struct panvk_cmd_buffer *cmdbuf,
++                     const struct panvk_shader_desc_info *desc_info,
++                     struct panvk_shader_desc_state *shader_desc,
++                     uint32_t dyn_first)
++{
++   const uint32_t size = shader_desc->driver_set.size;
++   const uint32_t res_count = panvk_shader_res_table_count(shader_desc);
++
++   if (!shader_desc->driver_set.cpu || !shader_desc->res_table_cpu ||
++       size < (dyn_first + desc_info->dyn_bufs.count) * PANVK_DESCRIPTOR_SIZE)
++      return VK_INCOMPLETE;
++
++   struct pan_ptr driver_set = panvk_cmd_alloc_dev_mem(
++      cmdbuf, desc, size, PANVK_DESCRIPTOR_SIZE);
++   if (!driver_set.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   struct pan_ptr res_table =
++      panvk_cmd_alloc_desc_array(cmdbuf, res_count, RESOURCE);
++   if (!res_table.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   struct panvk_opaque_desc *descs = driver_set.cpu;
++   memcpy(descs, shader_desc->driver_set.cpu, size);
++   panvk_per_arch(cmd_fill_dyn_bufs)(
++      &cmdbuf->state.gfx.desc_state, desc_info,
++      (struct mali_buffer_packed *)(&descs[dyn_first]));
++
++   struct mali_resource_packed *res = res_table.cpu;
++   pan_pack(&res[0], RESOURCE, cfg) {
++      cfg.address = driver_set.gpu;
++      cfg.size = size;
++      cfg.contains_descriptors = size > 0;
++   }
++   memcpy(&res[1],
++          (const struct mali_resource_packed *)shader_desc->res_table_cpu + 1,
++          (res_count - 1) * pan_size(RESOURCE));
++
++   shader_desc->driver_set.dev_addr = driver_set.gpu;
++   shader_desc->driver_set.cpu = driver_set.cpu;
++   shader_desc->res_table = res_table.gpu | res_count;
++   shader_desc->res_table_cpu = res_table.cpu;
++   return VK_SUCCESS;
++}
++
+ /* Only valid to call after prepare_vi() */
+ static bool
+ vs_desc_dirty(struct panvk_cmd_buffer *cmdbuf)
+@@ -445,8 +526,29 @@ prepare_vs_desc(struct panvk_cmd_buffer *cmdbuf,
+ {
+    prepare_vi(cmdbuf);
+ 
+-   if (!vs_desc_dirty(cmdbuf))
+-      return VK_SUCCESS;
++   if (!vs_desc_dirty(cmdbuf)) {
++      const struct panvk_shader_desc_info *vs_desc_info =
++         &cmdbuf->state.gfx.vs.shader->desc_info;
++
++      if (!stage_dyn_offs_dirty(cmdbuf, vs_desc_info))
++         return VK_SUCCESS;
++
++      /* Repeated tables (indirect draws) are patched on the GPU: rebuild. */
++      if (!cmdbuf->state.gfx.vs.desc_repeat_count) {
++         VkResult result = stage_patch_dyn_bufs(
++            cmdbuf, vs_desc_info, &cmdbuf->state.gfx.vs.desc,
++            MAX_VS_ATTRIBS + 1);
++         if (result != VK_INCOMPLETE) {
++            if (result == VK_SUCCESS) {
++               if (panvk_desc_split_enabled())
++                  gfx_state_set_dirty(cmdbuf, VS_SRT);
++               else
++                  gfx_state_set_dirty(cmdbuf, DESC_STATE);
++            }
++            return result;
++         }
++      }
++   }
+ 
+    cmdbuf->state.gfx.vs.desc_repeat_count = 0;
+    if (draw->indirect.buffer_dev_addr) {
+@@ -578,6 +680,7 @@ prepare_fs_driver_set(struct panvk_cmd_buffer *cmdbuf)
+       (struct mali_buffer_packed *)(&descs[sampler_idx + 1]));
+ 
+    fs_desc_state->driver_set.dev_addr = driver_set.gpu;
++   fs_desc_state->driver_set.cpu = driver_set.cpu;
+    fs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+    if (panvk_desc_split_enabled())
+       gfx_state_set_dirty(cmdbuf, FS_SRT);
+@@ -597,12 +700,29 @@ fs_desc_dirty(struct panvk_cmd_buffer *cmdbuf)
+ static VkResult
+ prepare_fs_desc(struct panvk_cmd_buffer *cmdbuf)
+ {
+-   if (!fs_desc_dirty(cmdbuf))
+-      return VK_SUCCESS;
+-
+    const struct panvk_shader *fs = get_fs(cmdbuf);
+    struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
+ 
++   if (!fs_desc_dirty(cmdbuf)) {
++      /* Without a fragment shader the tables aren't read, and one coming
++       * back flags FS (clear_dirty_after_draw()). */
++      if (!fs || !stage_dyn_offs_dirty(cmdbuf, &fs->desc_info))
++         return VK_SUCCESS;
++
++      VkResult result = stage_patch_dyn_bufs(
++         cmdbuf, &fs->desc_info, fs_desc_state,
++         fs->desc_info.fs_varying_attr_desc_count + 1);
++      if (result != VK_INCOMPLETE) {
++         if (result == VK_SUCCESS) {
++            if (panvk_desc_split_enabled())
++               gfx_state_set_dirty(cmdbuf, FS_SRT);
++            else
++               gfx_state_set_dirty(cmdbuf, DESC_STATE);
++         }
++         return result;
++      }
++   }
++
+    if (!fs) {
+       memset(fs_desc_state, 0, sizeof(*fs_desc_state));
+       return VK_SUCCESS;
+@@ -4253,6 +4373,7 @@ prepare_prerast_desc(struct panvk_cmd_buffer *cmdbuf,
+                                      (struct mali_buffer_packed *)(&descs[1]));
+ 
+    gs_desc->driver_set.dev_addr = driver_set.gpu;
++   gs_desc->driver_set.cpu = driver_set.cpu;
+    gs_desc->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+ 
+    return panvk_per_arch(cmd_prepare_shader_res_table)(cmdbuf, desc_state, info,
+diff --git a/src/panfrost/vulkan/panvk_cmd_desc_state.h b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+index 9b82fc38..8a372849 100644
+--- a/src/panfrost/vulkan/panvk_cmd_desc_state.h
++++ b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+@@ -35,9 +35,13 @@ struct panvk_shader_desc_state {
+ #else
+    struct {
+       uint64_t dev_addr;
++      /* CPU mapping of the (first copy of the) driver set. */
++      void *cpu;
+       uint32_t size;
+    } driver_set;
+    uint64_t res_table;
++   /* CPU mapping of the (first copy of the) resource table. */
++   void *res_table_cpu;
+ #endif
+ };
+ 
+@@ -64,6 +68,17 @@ struct panvk_descriptor_state {
+ 
+    uint32_t dyn_buf_offsets[MAX_SETS][MAX_DYNAMIC_BUFFERS];
+    uint32_t dyn_ssbos[MAX_SETS];
++
++   /* What sets[i] had when vkCmdBindDescriptorSets bound it, so a rebind of
++    * the same handle can tell it is still the same set. */
++   struct {
++      const struct panvk_descriptor_set_layout *layout;
++      uint64_t descs_dev;
++   } bound[MAX_SETS];
++
++   /* Graphics only, valid while DYN_OFFSETS is dirty: per set, the dynamic
++    * buffers whose offset a same-set rebind changed. */
++   uint32_t dyn_offs_changed[MAX_SETS];
+ };
+ 
+ #if PAN_ARCH < 9
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index dd31e93c..8d219715 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -192,6 +192,10 @@ enum panvk_cmd_graphics_dirty_state {
+     * writing (prepare_vs_driver_set(), prepare_fs_driver_set()). */
+    PANVK_CMD_GRAPHICS_DIRTY_VS_SRT,
+    PANVK_CMD_GRAPHICS_DIRTY_FS_SRT,
++   /* CSF: a vkCmdBindDescriptorSets rebound the graphics sets already bound
++    * and only moved dynamic buffers, listed in desc_state.dyn_offs_changed
++    * (instead of flagging DESC_STATE). */
++   PANVK_CMD_GRAPHICS_DIRTY_DYN_OFFSETS,
+    PANVK_CMD_GRAPHICS_DIRTY_STATE_COUNT,
+ };
+ 
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+index 6beab5f6..b0ce66ea 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+@@ -47,6 +47,8 @@ cmd_desc_state_bind_sets(struct panvk_descriptor_state *desc_state,
+                info->pDynamicOffsets[dynoffset_idx++];
+          }
+          desc_state->dyn_ssbos[set_idx] = set->layout->dyn_ssbos;
++         desc_state->bound[set_idx].layout = set->layout;
++         desc_state->bound[set_idx].descs_dev = set->descs.dev;
+       }
+    }
+ 
+@@ -309,6 +311,7 @@ panvk_per_arch(cmd_prepare_shader_res_table)(
+    }
+ 
+    shader_desc_state->res_table = ptr.gpu | res_count;
++   shader_desc_state->res_table_cpu = ptr.cpu;
+    return VK_SUCCESS;
+ }
+ #endif
+@@ -342,6 +345,64 @@ panvk_per_arch(cmd_prepare_push_descs)(struct panvk_cmd_buffer *cmdbuf,
+    return VK_SUCCESS;
+ }
+ 
++#if PAN_ARCH >= 10
++/* DXVK rebinds the set it already bound with new dynamic offsets whenever
++ * only constant-buffer offsets change. If every set in the call is the one
++ * bound at its index (same handle, still with the layout and descriptor
++ * memory it was bound with), bind them as cmd_desc_state_bind_sets() does
++ * and, instead of DESC_STATE, record which dynamic buffers moved: the draw
++ * then rebuilds only the tables of the stages reading one of them
++ * (stage_dyn_offs_dirty() in csf/panvk_vX_cmd_draw.c). The descriptor
++ * state ends up the same as with the full bind. Returns false, having
++ * changed nothing, if any set differs.
++ */
++static bool
++gfx_rebind_sets_dyn_offsets(struct panvk_cmd_buffer *cmdbuf,
++                            const VkBindDescriptorSetsInfoKHR *info)
++{
++   struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
++   uint32_t changed[MAX_SETS];
++   uint32_t any_changed = 0;
++   unsigned dynoffset_idx = 0;
++
++   for (unsigned i = 0; i < info->descriptorSetCount; ++i) {
++      unsigned set_idx = i + info->firstSet;
++      VK_FROM_HANDLE(panvk_descriptor_set, set, info->pDescriptorSets[i]);
++
++      if (!set || set != desc_state->sets[set_idx] ||
++          set == desc_state->push_sets[set_idx] ||
++          set->layout != desc_state->bound[set_idx].layout ||
++          set->descs.dev != desc_state->bound[set_idx].descs_dev)
++         return false;
++
++      changed[set_idx] = 0;
++      for (unsigned b = 0; b < set->layout->dyn_buf_count; b++) {
++         if (desc_state->dyn_buf_offsets[set_idx][b] !=
++             info->pDynamicOffsets[dynoffset_idx++])
++            changed[set_idx] |= BITFIELD_BIT(b);
++      }
++      any_changed |= changed[set_idx];
++   }
++
++   cmd_desc_state_bind_sets(desc_state, info);
++
++   /* Same sets, same offsets: nothing a draw reads changed. */
++   if (!any_changed)
++      return true;
++
++   if (!gfx_state_dirty(cmdbuf, DYN_OFFSETS))
++      memset(desc_state->dyn_offs_changed, 0,
++             sizeof(desc_state->dyn_offs_changed));
++
++   for (unsigned i = 0; i < info->descriptorSetCount; ++i)
++      desc_state->dyn_offs_changed[i + info->firstSet] |=
++         changed[i + info->firstSet];
++
++   gfx_state_set_dirty(cmdbuf, DYN_OFFSETS);
++   return true;
++}
++#endif
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdBindDescriptorSets2KHR)(
+    VkCommandBuffer commandBuffer,
+@@ -349,12 +410,20 @@ panvk_per_arch(CmdBindDescriptorSets2KHR)(
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
+-   /* TODO: Invalidate only if the shader tables are disturbed */
+    if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
+-      cmd_desc_state_bind_sets(&cmdbuf->state.gfx.desc_state,
+-                               pBindDescriptorSetsInfo);
++      bool done = false;
+ 
+-      gfx_state_set_dirty(cmdbuf, DESC_STATE);
++#if PAN_ARCH >= 10
++      done = panvk_dynoff_fast_enabled() &&
++             gfx_rebind_sets_dyn_offsets(cmdbuf, pBindDescriptorSetsInfo);
++#endif
++
++      if (!done) {
++         cmd_desc_state_bind_sets(&cmdbuf->state.gfx.desc_state,
++                                  pBindDescriptorSetsInfo);
++
++         gfx_state_set_dirty(cmdbuf, DESC_STATE);
++      }
+    }
+ 
+    if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
+-- 
+2.55.0
+
