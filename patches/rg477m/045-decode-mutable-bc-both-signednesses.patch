@@ -1,0 +1,529 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 14:50:15 -0400
+Subject: [PATCH] panvk: decode mutable BC4/BC5/BC6H images for both
+ signednesses
+
+vkd3d-proton creates every DXGI BC4/BC5/BC6H_TYPELESS texture as a
+MUTABLE_FORMAT image of the class's first member (BC4_UNORM, BC5_UNORM,
+BC6H_UFLOAT) with a format list of both members, and the shader resource
+views pick UNORM or SNORM (UF16 or SF16). With BC emulation, uploads decode
+the blocks once, as the image's own format, and every BC view samples that
+copy. A view with the other signedness therefore read the unsigned decode:
+a BC4_SNORM view of a BC4_UNORM image returned 1.0 where the blocks decode
+to -0.70, and BC6H SF16 views returned the UF16 values. Signed and unsigned
+blocks don't decode into each other (the endpoint order selects a
+different mode, endpoints are sign-extended), so the existing copy can't
+serve both.
+
+Give such images a second decoded copy, decoded as the other member: a
+MUTABLE image of these formats whose format list names the other member, or
+that has no list, gets bc_alt. Its copy is laid out after the first one
+(as bc_alt_shadow on the fragment-decode path, a LINEAR plane on the compute
+path), counted in the memory requirements, bound with the image, written by
+every decode (uploads, copies, zero-initialised transitions), and views in
+the bc_alt format sample it. Such images keep their raw blocks with
+PANVK_BC_DROP_RAW, since the second copy is decoded from them. UNORM/SRGB
+classes (BC1/2/3/7) need nothing: their decoded storage already serves both
+views. Images that aren't mutable, or list only one signedness, are
+unchanged.
+
+drawcpu bcmut (512x512 BC textures, 10 levels, created as vkd3d does,
+levels 0 and 1 sampled through each view and compared with a plain image of
+the view format): BC4/BC5 SNORM views of UNORM images and the reverse go
+from 480-512 of 512 texels wrong to exact, BC6H SF16 views of UF16 images
+and the reverse likewise, on the fragment and the compute decode path
+(PANVK_DEBUG=bc_compute); BC1/2/3/7 UNORM and SRGB views and non-mutable
+images unchanged. The second copy costs memory: such a 512x512 image takes
+930 KB instead of 553 KB (BC4), 1.80 MB instead of 1.08 MB (BC5) and
+4.81 MB instead of 1.78 MB (BC6H UF16, whose SF16 copy is RGBA16F).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: D3D12 correctness: mutable BC4/BC5/BC6H images (vkd3d-proton's *_TYPELESS textures) decode correctly through views of the other signedness (UNORM/SNORM, UF16/SF16); the emulated image was decoded once in its own format, so 480-512 of 512 texels came out wrong in the other view
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: applies after rg477m/044
+Validation test: native probe of vkd3d's typeless BC sequence 58/58 checks (rg477m/044: 10 failures), CPU-strict decode 34/34, compute decode path 58/58, PANVK_BC_DROP_RAW=1 clean; extra memory only for mutable BC4/5/6H (BC6H 512x512 1.78 -> 4.81 MB); combined build rg045.so (fcfb64ae4566, rg477m/001-045): PanProbe 38/38 x2; vkd3d-proton 2.14.1 suite 306 -> 309 PASS (test_shader_eval_attribute_dxbc/dxil FAIL -> PASS), none worse; Pseudoregalia 0 GPU faults, title scene renders; Deep Rock Galactic D3D12 title 71 fps; DXVK unchanged: Hades 460 fps, Jupiter Hell tutorial 49.1 fps, Serious Sam D3D11 57.8 fps (uncapped, quietd Stock)
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/panvk_image.c         | 112 ++++++++++++++++++++--
+ src/panfrost/vulkan/panvk_image.h         |  35 +++++++
+ src/panfrost/vulkan/panvk_vX_cmd_meta.c   |  82 +++++++++++-----
+ src/panfrost/vulkan/panvk_vX_image_view.c |  10 +-
+ 4 files changed, 205 insertions(+), 34 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index 11aeb42..61ab98d 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -448,7 +448,8 @@ panvk_should_checksum(struct panvk_image *image,
+  * bc_decoded. MUTABLE keeps CRC off: the decode never redraws a tile with
+  * the same content, so CRC tracking would be pure overhead. */
+ static void
+-panvk_bc_shadow_info(const struct panvk_image *image, VkImageCreateInfo *info,
++panvk_bc_shadow_info(const struct panvk_image *image, VkFormat format,
++                     VkImageCreateInfo *info,
+                      VkImageDrmFormatModifierListCreateInfoEXT *afrc)
+ {
+    *info = (VkImageCreateInfo){
+@@ -456,7 +457,7 @@ panvk_bc_shadow_info(const struct panvk_image *image, VkImageCreateInfo *info,
+       .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                (image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT),
+       .imageType = VK_IMAGE_TYPE_2D,
+-      .format = image->bc_format,
++      .format = format,
+       .extent = image->vk.extent,
+       .mipLevels = image->vk.mip_levels,
+       .arrayLayers = image->vk.array_layers,
+@@ -499,7 +500,7 @@ panvk_bc_shadow_info(const struct panvk_image *image, VkImageCreateInfo *info,
+       debug_get_num_option("PANVK_BC_AFRC", bc8 ? 16 : bc12 ? 24 : 32);
+ 
+    if ((cu == 16 || cu == 24 || cu == 32) &&
+-       image->bc_format == VK_FORMAT_R8G8B8A8_UNORM &&
++       format == VK_FORMAT_R8G8B8A8_UNORM &&
+        !(image->vk.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+        pan_query_afrc(&phys_dev->kmod.dev->props)) {
+       *afrc = (VkImageDrmFormatModifierListCreateInfoEXT){
+@@ -513,6 +514,13 @@ panvk_bc_shadow_info(const struct panvk_image *image, VkImageCreateInfo *info,
+    }
+ }
+ 
++/* End of a decoded BC plane relative to where it is bound. */
++static uint64_t
++panvk_bc_plane_end(const struct panvk_image_plane *p)
++{
++   return p->plane.layout.slices[0].offset_B + p->plane.layout.data_size_B;
++}
++
+ static VkResult
+ panvk_image_init_layouts(struct panvk_image *image,
+                          const VkImageCreateInfo *pCreateInfo)
+@@ -597,7 +605,7 @@ panvk_image_init_layouts(struct panvk_image *image,
+       VkImageDrmFormatModifierListCreateInfoEXT afrc;
+       struct panvk_image tmp = {0};
+ 
+-      panvk_bc_shadow_info(image, &sci, &afrc);
++      panvk_bc_shadow_info(image, image->bc_format, &sci, &afrc);
+       vk_image_init(&dev->vk, &tmp.vk, &sci);
+       VkResult result = panvk_image_init(&tmp, &sci);
+       vk_image_finish(&tmp.vk);
+@@ -608,6 +616,24 @@ panvk_image_init_layouts(struct panvk_image *image,
+       image->bc_decoded.image.planes[0] = &image->bc_decoded.plane;
+       image->bc_decoded_offset =
+          image->bc_noraw ? 0 : ALIGN_POT(plane_layout.offset_B, 4096);
++
++      if (image->bc_alt != VK_FORMAT_UNDEFINED) {
++         /* The other-signedness copy, as bc_alt_shadow will be, after it. */
++         struct panvk_image alt = {0};
++
++         panvk_bc_shadow_info(image, image->bc_alt_format, &sci, &afrc);
++         vk_image_init(&dev->vk, &alt.vk, &sci);
++         result = panvk_image_init(&alt, &sci);
++         vk_image_finish(&alt.vk);
++         if (result != VK_SUCCESS)
++            return result;
++
++         image->bc_alt_decoded = alt.planes[0];
++         image->bc_alt_decoded.image.planes[0] = &image->bc_alt_decoded.plane;
++         image->bc_alt_offset =
++            ALIGN_POT(image->bc_decoded_offset +
++                         panvk_bc_plane_end(&image->bc_decoded), 4096);
++      }
+    } else if (image->bc_emul) {
+       struct pan_image *dec = &image->bc_decoded.image;
+       enum pipe_format dec_pfmt = vk_format_to_pipe_format(image->bc_format);
+@@ -621,6 +647,23 @@ panvk_image_init_layouts(struct panvk_image *image,
+       if (!pan_image_layout_init(arch, dec, 0, &plane_layout))
+          return panvk_error(image->vk.base.device,
+                             VK_ERROR_INITIALIZATION_FAILED);
++
++      if (image->bc_alt != VK_FORMAT_UNDEFINED) {
++         struct pan_image *alt = &image->bc_alt_decoded.image;
++
++         *alt = (struct pan_image){
++            .props = get_pan_image_props(
++               &image->vk, vk_format_to_pipe_format(image->bc_alt_format), 0,
++               false),
++            .mod_handler = mod_handler,
++         };
++         alt->planes[0] = &image->bc_alt_decoded.plane;
++         plane_layout.offset_B =
++            ALIGN_POT(panvk_bc_plane_end(&image->bc_decoded), 4096);
++         if (!pan_image_layout_init(arch, alt, 0, &plane_layout))
++            return panvk_error(image->vk.base.device,
++                               VK_ERROR_INITIALIZATION_FAILED);
++      }
+    }
+ 
+    return VK_SUCCESS;
+@@ -716,9 +759,12 @@ panvk_image_get_total_size(const struct panvk_image *image)
+    for (uint8_t plane = 0; plane < image->plane_count; plane++)
+       size = MAX2(size, panvk_image_plane_size(image, plane));
+    if (image->bc_emul) {
+-      const struct pan_image_layout *l = &image->bc_decoded.plane.layout;
+-      size = MAX2(size, image->bc_decoded_offset + l->slices[0].offset_B +
+-                           l->data_size_B);
++      size = MAX2(size, image->bc_decoded_offset +
++                           panvk_bc_plane_end(&image->bc_decoded));
++   }
++   if (image->bc_alt != VK_FORMAT_UNDEFINED) {
++      size = MAX2(size, image->bc_alt_offset +
++                           panvk_bc_plane_end(&image->bc_alt_decoded));
+    }
+    return size;
+ }
+@@ -772,10 +818,28 @@ panvk_image_init(struct panvk_image *image,
+                    pan_arch(phys_dev->kmod.dev->props.gpu_id) >= 10 &&
+                    image->vk.image_type == VK_IMAGE_TYPE_2D &&
+                    !PANVK_DEBUG(BC_COMPUTE) && !PANVK_DEBUG(NO_GS);
++   /* A mutable image that lists the other-signedness member as a view format
++    * (or lists none) gets a second decoded copy for it. */
++   image->bc_alt = VK_FORMAT_UNDEFINED;
++   if (image->bc_emul &&
++       (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
++      const VkFormat other = panvk_bc_other_sign(image->vk.format);
++      const VkImageFormatListCreateInfo *list =
++         vk_find_struct_const(pCreateInfo->pNext,
++                              IMAGE_FORMAT_LIST_CREATE_INFO);
++      bool listed = !list || !list->viewFormatCount;
++
++      for (uint32_t i = 0; list && i < list->viewFormatCount; i++)
++         listed |= list->pViewFormats[i] == other;
++      if (listed)
++         image->bc_alt = other;
++   }
+    /* PANVK_BC_DROP_RAW: reading the blocks back breaks, so it is off by default except in the unsafe build profile.
+-    * Images the app may view or map as raw blocks keep them. */
++    * Images the app may view or map as raw blocks keep them, and so do the
++    * ones with a second decoded copy, which is decoded from them. */
+    image->bc_noraw =
+-      image->bc_gfx && debug_get_bool_option("PANVK_BC_DROP_RAW", PANVK_PROFILE_UNSAFE) &&
++      image->bc_gfx && image->bc_alt == VK_FORMAT_UNDEFINED &&
++      debug_get_bool_option("PANVK_BC_DROP_RAW", PANVK_PROFILE_UNSAFE) &&
+       pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
+       !(pCreateInfo->flags & (VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
+                               VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+@@ -787,6 +851,12 @@ panvk_image_init(struct panvk_image *image,
+             ? panvk_bc_compact_format(image->vk.format, PANVK_DEBUG(BC_WIDE))
+             : panvk_bc_decoded_format(image->vk.format);
+    }
++   if (image->bc_alt != VK_FORMAT_UNDEFINED) {
++      image->bc_alt_format =
++         image->bc_gfx
++            ? panvk_bc_compact_format(image->bc_alt, PANVK_DEBUG(BC_WIDE))
++            : panvk_bc_decoded_format(image->bc_alt);
++   }
+ 
+    /* Add any create/usage flags that might be needed for meta operations.
+     * This is run before the modifier selection because some
+@@ -1006,10 +1076,20 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
+       VkImageCreateInfo sci;
+       VkImageDrmFormatModifierListCreateInfoEXT afrc;
+ 
+-      panvk_bc_shadow_info(image, &sci, &afrc);
++      panvk_bc_shadow_info(image, image->bc_format, &sci, &afrc);
+       result = panvk_CreateImage(device, &sci, pAllocator, &image->bc_shadow);
+       if (result != VK_SUCCESS)
+          goto err_destroy_image;
++
++      if (image->bc_alt != VK_FORMAT_UNDEFINED) {
++         panvk_bc_shadow_info(image, image->bc_alt_format, &sci, &afrc);
++         result = panvk_CreateImage(device, &sci, pAllocator,
++                                    &image->bc_alt_shadow);
++         if (result != VK_SUCCESS) {
++            panvk_DestroyImage(device, image->bc_shadow, pAllocator);
++            goto err_destroy_image;
++         }
++      }
+    }
+ 
+    *pImage = panvk_image_to_handle(image);
+@@ -1036,6 +1116,7 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
+       return;
+ 
+    panvk_DestroyImage(_device, image->bc_shadow, pAllocator);
++   panvk_DestroyImage(_device, image->bc_alt_shadow, pAllocator);
+ 
+    if (image->vk.create_flags &
+        VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+@@ -1449,6 +1530,17 @@ panvk_image_bind(struct panvk_device *dev,
+                dec_offset);
+          }
+       }
++      if (image->bc_alt != VK_FORMAT_UNDEFINED) {
++         const uint64_t alt_offset = offset + image->bc_alt_offset;
++
++         panvk_image_plane_bind_mem(dev, &image->bc_alt_decoded, mem,
++                                    alt_offset);
++         if (image->bc_alt_shadow) {
++            panvk_image_plane_bind_mem(
++               dev, &panvk_image_from_handle(image->bc_alt_shadow)->planes[0],
++               mem, alt_offset);
++         }
++      }
+       panvk_image_report_binding(dev, image,
+                                  VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+    }
+diff --git a/src/panfrost/vulkan/panvk_image.h b/src/panfrost/vulkan/panvk_image.h
+index 149c7bc..db04006 100644
+--- a/src/panfrost/vulkan/panvk_image.h
++++ b/src/panfrost/vulkan/panvk_image.h
+@@ -74,6 +74,18 @@ struct panvk_image {
+    struct panvk_image_plane bc_decoded;
+    uint64_t bc_decoded_offset;
+    VkImage bc_shadow;
++   /* A mutable BC4/BC5/BC6H image that may be viewed with the other
++    * signedness (DXGI BCn_TYPELESS through vkd3d-proton): signed and unsigned
++    * blocks decode differently (sign extension, mode selection), so it gets a
++    * second decoded copy, decoded as bc_alt (VK_FORMAT_UNDEFINED when there
++    * is none) and stored as bc_alt_format. It is laid out, bound and written
++    * like bc_decoded (bc_alt_shadow on the fragment path), bc_alt_offset
++    * bytes after the image base. */
++   VkFormat bc_alt;
++   VkFormat bc_alt_format;
++   struct panvk_image_plane bc_alt_decoded;
++   uint64_t bc_alt_offset;
++   VkImage bc_alt_shadow;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_image, vk.base, VkImage,
+@@ -101,6 +113,29 @@ panvk_format_is_bc(VkFormat format)
+           format <= VK_FORMAT_BC7_SRGB_BLOCK;
+ }
+ 
++/* The member of the same BC class with the other signedness (BC4/BC5 UNORM
++ * and SNORM, BC6H UFLOAT and SFLOAT), VK_FORMAT_UNDEFINED for the others. */
++static inline VkFormat
++panvk_bc_other_sign(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_BC4_UNORM_BLOCK:
++      return VK_FORMAT_BC4_SNORM_BLOCK;
++   case VK_FORMAT_BC4_SNORM_BLOCK:
++      return VK_FORMAT_BC4_UNORM_BLOCK;
++   case VK_FORMAT_BC5_UNORM_BLOCK:
++      return VK_FORMAT_BC5_SNORM_BLOCK;
++   case VK_FORMAT_BC5_SNORM_BLOCK:
++      return VK_FORMAT_BC5_UNORM_BLOCK;
++   case VK_FORMAT_BC6H_UFLOAT_BLOCK:
++      return VK_FORMAT_BC6H_SFLOAT_BLOCK;
++   case VK_FORMAT_BC6H_SFLOAT_BLOCK:
++      return VK_FORMAT_BC6H_UFLOAT_BLOCK;
++   default:
++      return VK_FORMAT_UNDEFINED;
++   }
++}
++
+ /* Storage format of the decoded plane. BC4/BC5 use 16-bit RG to keep the
+  * interpolation precision; BC1-3/7 decode to RGBA8, BC6H to RGBA16F. */
+ static inline VkFormat
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index 43332e2..0424a4e 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -801,14 +801,17 @@ get_bc_decode_gfx_pipeline(struct panvk_device *dev, uint32_t shader,
+                                            pipeline_out);
+ }
+ 
+-/* Fragment decode of one region into bc_shadow: a layered draw over the
+- * region, so the tile writeback produces whatever layout (AFBC,
+- * U-interleaved) and format the shadow image got. Must run between
+- * meta_gfx_start() and meta_gfx_end(). */
++/* Fragment decode of one region, as BC format bc, into shadow (stored as
++ * format): a layered draw over the region, so the tile writeback produces
++ * whatever layout (AFBC, U-interleaved) and format the shadow image got. Must
++ * run between meta_gfx_start() and meta_gfx_end(). */
+ static void
+-bc_decode_region_gfx(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+-                     const VkImageSubresourceLayers *subres, VkOffset3D offset,
+-                     VkExtent3D extent, const struct bc_decode_src *src)
++bc_decode_region_gfx_as(struct panvk_cmd_buffer *cmdbuf,
++                        struct panvk_image *img, VkImage shadow,
++                        VkFormat format, VkFormat bc,
++                        const VkImageSubresourceLayers *subres,
++                        VkOffset3D offset, VkExtent3D extent,
++                        const struct bc_decode_src *src)
+ {
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+@@ -826,8 +829,7 @@ bc_decode_region_gfx(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+    VkPipelineLayout layout;
+    VkPipeline pipeline;
+    VkResult result = get_bc_decode_gfx_pipeline(
+-      dev, bc_decode_shader_index(img->vk.format), img->bc_format, &layout,
+-      &pipeline);
++      dev, bc_decode_shader_index(bc), format, &layout, &pipeline);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmdbuf->vk, result);
+       return;
+@@ -841,9 +843,9 @@ bc_decode_region_gfx(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+       .pNext = &view_usage,
+       .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+-      .image = img->bc_shadow,
++      .image = shadow,
+       .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+-      .format = img->bc_format,
++      .format = format,
+       .subresourceRange = {
+          .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+          .baseMipLevel = level,
+@@ -884,7 +886,7 @@ bc_decode_region_gfx(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+       .width = w,
+       .height = h,
+       .depth = layers,
+-      .format = img->vk.format,
++      .format = bc,
+       .x0 = x0,
+       .y0 = y0,
+    };
+@@ -903,6 +905,22 @@ bc_decode_region_gfx(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+    disp->CmdEndRendering(cmd);
+ }
+ 
++/* Fragment decode of one region into bc_shadow, and into bc_alt_shadow as
++ * the other signedness when the image has that copy. */
++static void
++bc_decode_region_gfx(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
++                     const VkImageSubresourceLayers *subres, VkOffset3D offset,
++                     VkExtent3D extent, const struct bc_decode_src *src)
++{
++   bc_decode_region_gfx_as(cmdbuf, img, img->bc_shadow, img->bc_format,
++                           img->vk.format, subres, offset, extent, src);
++   if (img->bc_alt != VK_FORMAT_UNDEFINED) {
++      bc_decode_region_gfx_as(cmdbuf, img, img->bc_alt_shadow,
++                              img->bc_alt_format, img->bc_alt, subres, offset,
++                              extent, src);
++   }
++}
++
+ static void bc_noraw_warn_once(const char *what);
+ 
+ /* Source of a decode that reads the raw plane of img itself. */
+@@ -924,11 +942,13 @@ bc_raw_plane_src(const struct panvk_image *img,
+    };
+ }
+ 
+-/* Decode raw BC blocks (planes[0]) of one copy region into bc_decoded. */
++/* Decode raw BC blocks (planes[0]) of one copy region, as BC format bc,
++ * into the decoded plane dec. */
+ static void
+-bc_decode_region(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+-                 const VkImageSubresourceLayers *subres, VkOffset3D offset,
+-                 VkExtent3D extent)
++bc_decode_region_as(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
++                    struct panvk_image_plane *dec, VkFormat bc,
++                    const VkImageSubresourceLayers *subres, VkOffset3D offset,
++                    VkExtent3D extent)
+ {
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+@@ -937,7 +957,7 @@ bc_decode_region(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+    VkPipeline pipeline;
+ 
+    VkResult result = get_bc_decode_pipeline(
+-      dev, bc_decode_shader_index(img->vk.format), &layout, &pipeline);
++      dev, bc_decode_shader_index(bc), &layout, &pipeline);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmdbuf->vk, result);
+       return;
+@@ -947,12 +967,12 @@ bc_decode_region(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+    const VkExtent3D mip = vk_image_mip_level_extent(&img->vk, level);
+    const bool is_3d = img->vk.image_type == VK_IMAGE_TYPE_3D;
+    const struct pan_image_layout *sl = &img->planes[0].plane.layout;
+-   const struct pan_image_layout *dl = &img->bc_decoded.plane.layout;
++   const struct pan_image_layout *dl = &dec->plane.layout;
+    const struct pan_image_slice_layout *ss = &sl->slices[level];
+    const struct pan_image_slice_layout *ds = &dl->slices[level];
+    const unsigned blk_B = vk_format_get_blocksize(img->vk.format);
+    const unsigned texel_B =
+-      vk_format_get_blocksize(panvk_bc_decoded_format(img->vk.format));
++      vk_format_get_blocksize(panvk_bc_decoded_format(bc));
+ 
+    const uint32_t x0 = offset.x & ~3, y0 = offset.y & ~3;
+    const uint32_t z0 = is_3d ? offset.z : subres->baseArrayLayer;
+@@ -972,7 +992,7 @@ bc_decode_region(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+                         z0 * src_z_B +
+                         (y0 / 4) * ss->tiled_or_linear.row_stride_B +
+                         (x0 / 4) * blk_B;
+-   const uint64_t dst = img->bc_decoded.plane.base + ds->offset_B +
++   const uint64_t dst = dec->plane.base + ds->offset_B +
+                         z0 * dst_z_B +
+                         y0 * ds->tiled_or_linear.row_stride_B + x0 * texel_B;
+ 
+@@ -986,7 +1006,7 @@ bc_decode_region(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+       .width = w,
+       .height = h,
+       .depth = d,
+-      .format = img->vk.format,
++      .format = bc,
+    };
+ 
+    disp->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+@@ -995,6 +1015,21 @@ bc_decode_region(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+    disp->CmdDispatch(cmd, DIV_ROUND_UP(w, 8), DIV_ROUND_UP(h, 8), d);
+ }
+ 
++/* Decode raw BC blocks (planes[0]) of one copy region into bc_decoded, and
++ * into bc_alt_decoded as the other signedness when the image has that copy. */
++static void
++bc_decode_region(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
++                 const VkImageSubresourceLayers *subres, VkOffset3D offset,
++                 VkExtent3D extent)
++{
++   bc_decode_region_as(cmdbuf, img, &img->bc_decoded, img->vk.format, subres,
++                       offset, extent);
++   if (img->bc_alt != VK_FORMAT_UNDEFINED) {
++      bc_decode_region_as(cmdbuf, img, &img->bc_alt_decoded, img->bc_alt,
++                          subres, offset, extent);
++   }
++}
++
+ static void
+ bc_decode_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 dst_stage,
+                   VkAccessFlags2 dst_access)
+@@ -1576,11 +1611,14 @@ copy_image_bc_noraw(VkCommandBuffer commandBuffer,
+ 
+    if (src->bc_noraw) {
+       /* Only the decoded texels exist: they can go to another decoded
+-       * copy, never back to blocks. */
++       * copy, never back to blocks, nor to a copy decoded with the other
++       * signedness. */
+       if (dst->bc_gfx)
+          bc_copy_decoded(commandBuffer, info, src, dst);
+       else
+          bc_noraw_warn_once("copy to a non-BC or compute-decoded image");
++      if (dst->bc_alt != VK_FORMAT_UNDEFINED)
++         bc_noraw_warn_once("copy to a mutable signed/unsigned BC image");
+       return;
+    }
+ 
+diff --git a/src/panfrost/vulkan/panvk_vX_image_view.c b/src/panfrost/vulkan/panvk_vX_image_view.c
+index e611422..4764d56 100644
+--- a/src/panfrost/vulkan/panvk_vX_image_view.c
++++ b/src/panfrost/vulkan/panvk_vX_image_view.c
+@@ -461,9 +461,15 @@ panvk_per_arch(CreateImageView)(VkDevice _device,
+       view->pview.format = panvk_image_depth_only_pfmt(image);
+ 
+    if (image->bc_emul && panvk_format_is_bc(view->vk.view_format)) {
+-      view->pview.format = panvk_bc_view_pfmt(image, view->vk.view_format);
++      /* A view with the other signedness reads the copy decoded as such. */
++      const bool alt = image->bc_alt != VK_FORMAT_UNDEFINED &&
++                       view->vk.view_format == image->bc_alt;
++
++      view->pview.format =
++         alt ? vk_format_to_pipe_format(image->bc_alt_format)
++             : panvk_bc_view_pfmt(image, view->vk.view_format);
+       view->pview.planes[0] = (struct pan_image_plane_ref){
+-         .image = &image->bc_decoded.image,
++         .image = alt ? &image->bc_alt_decoded.image : &image->bc_decoded.image,
+          .plane_idx = 0,
+       };
+ 
+-- 
+2.55.0
+
