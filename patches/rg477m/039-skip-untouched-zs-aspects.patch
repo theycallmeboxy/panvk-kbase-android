@@ -1,0 +1,797 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:50:34 -0400
+Subject: [PATCH] panvk/csf: skip the load and store of depth/stencil aspects a
+ pass never touches
+
+DXVK binds the game's depth-stencil view to every pass, also to passes
+none of whose draws enable the depth or stencil test. Hades (D3D11, the
+rpcount build, about 228 fps) has 32.5k passes/s, 18.9k of them with a
+depth attachment: 16.6k/s LOAD + DONT_CARE, 2.25k/s CLEAR + STORE, and no
+draw in any of them touches depth. 18.9k passes/s run a preload, and 2.26M
+of the 3.1M tiles walked per second are preloaded: almost all of it a
+late-ZS depth reload nobody reads.
+
+A depth or stencil aspect that is loaded (LOAD_OP_LOAD, or the forced
+preload of DONT_CARE/NONE with STORE_OP_NONE) or stored but that nothing in
+the pass reads or writes now has its preload, its write-back and its
+incremental-rendering spills dropped. With storeOp DONT_CARE the contents
+are undefined anyway; with STORE or NONE they must equal the loaded ones,
+which memory already holds: not writing them back leaves the plane and its
+AFBC headers byte for byte as they were (Z/S planes have no CRC).
+
+"Touched" is conservative, from the state each draw (API or vk_meta) is
+recorded with: the depth test (depth writes need it) or depth bounds test
+enabled, a fragment shader reading depth (input attachment, tile read),
+rasterization-order depth access; stencil likewise with the stencil test.
+vkCmdClearAttachments of the aspect and any vkCmdExecuteCommands in the
+pass count as touching it. Candidates are fixed at vkCmdBeginRendering:
+separate Z/S planes, no CLEAR load op, no resolve, no multisampled render
+to single sampled, no multiview, no suspend/resume, not a secondary
+continuing a pass, and only on v11/v12 (v10 bakes FBD words into its CRC
+patch commands; v13+ HSR and v14 layer state aren't covered).
+
+The FBDs are emitted at the first draw, before the pass's use is known.
+get_fb_descs() now emits them with the candidates untouched so far dropped,
+the final answer for most passes. If a later draw touches a dropped aspect,
+vkCmdEndRendering restores its load/store and writes the main and IR FBD
+sets again in place (new emit_fb_desc_sets(), split out of get_fb_descs()):
+the command stream refers to them by address only and patches them (tiler
+pointer of simultaneous-use copies, CRC init, provoking vertex) when it
+runs, and their tag, size and layout follow the formats, not the Z/S
+load/store. Nothing else recorded during the pass reads that state.
+
+Compatibility channel. PANVK_NO_ZS_UNTOUCHED_SKIP=1 restores the old
+behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: GPU bandwidth: a depth or stencil aspect that no draw in a pass touches is no longer preloaded, written back or spilled (DXVK binds the depth view to every pass; Hades: 16.6k such LOAD passes/s); PANVK_NO_ZS_UNTOUCHED_SKIP=1 disables
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/038 (stacked); v11/v12 only
+Validation test: drawcpu zscheck 7 cases x 3 depth formats PASS, checksums identical skip on/off/previous build; synthetic Hades-like pattern GPU 1.98 -> 1.54 ms/frame (-22%, 20 interleaved runs, 1255 MHz); PanProbe 38/38 x2; Hades A-B-B-A x2 at 1255 MHz 227.7 -> 228.8 fps (+0.5%, n.s.); combined build d6.so (443dfbaf1028, rg477m/023-041): 16-game boot sweep 2026-10-25 in quietd Stock mode (boot check, FPS limiter on): all 16 boot to their known states (Hades, Arkham, Serious Sam, Jupiter Hell, Risk of Rain 2, Moonlighter, Megabonk, Portal 2, Gladius, Crysis 3 Remastered render; Factorio and Ashes menus; Descenders; Tomb Raider ToS screen; Doom 3 BFG white window; Metro 2033 black), 0 GPU faults; uncapped gameplay A-B-B-A vs compat (quietd Stock, FPS limiter off): Hades hub at 1255 MHz 224.7 vs 224.9 fps (n=4 each, GPU-bound), Jupiter Hell tutorial level 48.5 vs 48.6 fps (n=4 each), Serious Sam bot benchmark D3D11 57.0 vs 58.9 fps (n=2 each), Risk of Rain 2 stage 1 27.6 vs 28.8 fps (n=5 each, random maps; the B17 memory guard ended 1 of 6 runs in each arm); Arkham Asylum 20-round interleaved gameplay gate 2026-10-25/26 (quietd Stock, FPS limiter off), base rg477m/023-037 vs this: gameplay fps 36.24 vs 36.25 (n=17 each), load failures (B5 signatures: appUncompressMemory/BulkData assertions, pure-virtual dialog) 2/19 vs 3/20 (B5 base rate: stock 7/38, ours 16/138), 0 GPU faults
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c |   5 +
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   | 537 ++++++++++++++----
+ src/panfrost/vulkan/panvk_cmd_draw.h          |  28 +
+ src/panfrost/vulkan/panvk_vX_cmd_meta.c       |  10 +
+ 4 files changed, 479 insertions(+), 101 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index 842bc996..f37877ef 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -1746,6 +1746,11 @@ panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
+    if (commandBufferCount == 0)
+       return;
+ 
++   /* The secondaries' draws aren't seen: keep the depth/stencil loads and
++    * stores of the current pass (zs_untouched_skip_end()). */
++   primary->state.gfx.render.zs_skip.touched |=
++      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++
+    /* Write out any pending seqno changes to registers before calling
+     * secondary command buffers. */
+    flush_sync_points(primary);
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 9730642f..e95e2e7e 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -1871,80 +1871,50 @@ spare_fbd_reuse_enabled(void)
+    return !disabled;
+ }
+ 
++/* Writes the FBDs of the pass (render->fbds) and of the incremental-rendering
++ * passes get_fb_descs() built (render->ir.fbds_cpu[]) from the current render
++ * state, with the frame shaders they need. CPU only: the command stream refers
++ * to these descriptors by address, and patches them (tiler pointer of the
++ * simultaneous-use copies, CRC init, provoking vertex) only when it runs, so
++ * they can be written again until the command buffer is submitted, see
++ * zs_untouched_skip_end().
++ *
++ * The IR FBD sets are only read by the tiler OOM handler, which runs while
++ * the tiler of this pass is out of heap memory. The frame shaders depend only
++ * on (fb, load, resolve), not on the layer or the store:
++ * cmd_get_frame_shaders() reads neither, and the DCDs it emits are never
++ * patched afterwards. Without a resolve shader the main set (fb.load,
++ * resolve) equals IR_FIRST's (fb.load, NULL) and IR_MIDDLE's (spill.load,
++ * NULL) equals IR_LAST's (spill.load, resolve): no post-frame DCD is emitted
++ * for either and modes[2] stays NEVER. Reuse them then; otherwise build each
++ * IR pass's own set, once for all its layers. */
+ static VkResult
+-get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+-{
+-   assert(cmdbuf->state.gfx.render.invalidate_inherited_ctx ||
+-          !inherits_render_ctx(cmdbuf));
+-
+-   if (cmdbuf->state.gfx.render.fbds.gpu ||
+-       !cmdbuf->state.gfx.render.layer_count)
+-      return VK_SUCCESS;
+-
+-   uint32_t view_mask_temp = cmdbuf->state.gfx.render.view_mask;
+-   uint32_t enabled_layer_count = calc_enabled_layer_count(cmdbuf);
+-   uint32_t fbd_sz = calc_fbd_size(cmdbuf);
+-   uint32_t fbds_sz = enabled_layer_count * fbd_sz;
+-
+-#if PAN_ARCH >= 14
+-   const unsigned fbds_alignment = alignof(struct panvk_fb_layer_state);
+-#else
+-   const unsigned fbds_alignment = pan_alignment(FRAMEBUFFER);
++emit_fb_desc_sets(struct panvk_cmd_buffer *cmdbuf, uint32_t *fbd_flags_out
++#if PAN_ARCH == 10
++                  , uint32_t *crc_fbd_flags_out, uint32_t *crc_rtd_flags_out
+ #endif
+-   cmdbuf->state.gfx.render.fbds =
+-      panvk_cmd_alloc_dev_mem(cmdbuf, desc, fbds_sz, fbds_alignment);
+-   if (!cmdbuf->state.gfx.render.fbds.gpu)
+-      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+-
++                  )
++{
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
+-
+-   /* At this point, we should know sample count and the tile size should have
+-    * been calculated */
+-   assert(render->fb.layout.sample_count > 0);
+-   assert(render->fb.layout.tile_size_px > 0);
+    const uint8_t sample_count = render->fb.layout.sample_count;
++   const bool has_zs_crc_ext = render->fbd_emit.has_zs_crc_ext;
++   const uint32_t enabled_layer_count = calc_enabled_layer_count(cmdbuf);
++   const uint32_t fbd_sz = calc_fbd_size(cmdbuf);
++   const struct pan_ptr fbds = render->fbds;
++   uint32_t fbd_flags = 0;
+ 
+-   bool simul_use =
+-      cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+-
+-   /* The only bit we patch in FBDs is the tiler pointer and CRC. If tiler
+-    * is not involved (clear job) with no CRC, or if the update can happen in
+-    * place (not simultaneous use of the command buffer), we can avoid the copy.
+-    *
+-    * According to VUID-VkSubmitInfo2KHR-commandBuffer-06192 and
+-    * VUID-VkSubmitInfo2KHR-commandBuffer-06010, suspend/resume operations
+-    * can't cross the vkQueueSubmit2() boundary, so no need to dynamically
+-    * allocate descriptors in that case:
+-    * "
+-    *   If any commandBuffer member of an element of pCommandBufferInfos
+-    *   contains any suspended render pass instances, they must be resumed by a
+-    *   render pass instance later in submission order within
+-    *   pCommandBufferInfos.
+-    *
+-    *   If any commandBuffer member of an element of pCommandBufferInfos
+-    *   contains any resumed render pass instances, they must be suspended by a
+-    *   render pass instance earlier in submission order within
+-    *   pCommandBufferInfos.
+-    * "
+-    */
+ #if PAN_ARCH == 10
+    struct pan_fb_crc_rt_info crc_info;
+    const bool has_crc_patch = render_get_crc_info(cmdbuf, &crc_info);
+    uint32_t crc_fbd_flags = 0;
+    uint32_t crc_rtd_flags = 0;
+-#elif PAN_ARCH >= 11
+-   const bool has_crc_patch = render_needs_crc_patch(cmdbuf);
+ #endif
+-   const bool copy_fbds =
+-      simul_use && (cmdbuf->state.gfx.render.tiler || has_crc_patch);
+-   const bool has_zs_crc_ext = render_needs_zs_crc_ext(cmdbuf);
+-   struct pan_ptr fbds = cmdbuf->state.gfx.render.fbds;
+-   uint32_t fbd_flags = 0;
+ 
+    /* We prepare all FB descriptors upfront. For multiview, only create FBDs
+     * for enabled views. */
+-   bool multiview = cmdbuf->state.gfx.render.view_mask;
++   uint32_t view_mask_temp = render->view_mask;
++   bool multiview = render->view_mask;
+ 
+    struct pan_tiler_context tiler_ctx;
+    struct pan_fb_desc_info fbd_info = {
+@@ -1954,7 +1924,7 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+       .force_zs_crc_ext = has_zs_crc_ext,
+       .sample_pos_array_pointer = dev->sample_positions->addr.dev +
+          pan_sample_positions_offset(pan_sample_pattern(sample_count)),
+-      .provoking_vertex_first = get_first_provoking_vertex(cmdbuf),
++      .provoking_vertex_first = render->fbd_emit.provoking_vertex_first,
+       .allow_hsr_prepass = PAN_ARCH >= 13 && PANVK_DEBUG(HSR_PREPASS),
+       .tiler_ctx = &tiler_ctx,
+    };
+@@ -2007,31 +1977,7 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+ #endif
+    }
+ 
+-#if PAN_ARCH >= 14
+-   /* fbd_flags is unused on v14+. */
+-   assert(!fbd_flags);
+-#endif
+-
+-   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_FRAGMENT);
+-   invalidate_unselected_crc_rts(b, &fbd_info);
+-
+-   /* The IR FBD sets are only read by the tiler OOM handler, which runs while
+-    * the tiler of this pass is out of heap memory. With no tiler context
+-    * (render->tiler == 0: get_fb_descs() called from CmdEndRendering for a
+-    * clear-only pass, which ends the pass), nothing is tiled and that can't
+-    * happen, so skip them. Any draw allocates the tiler context first
+-    * (get_render_ctx()), so a pass with draws never gets here with
+-    * tiler == 0.
+-    *
+-    * The frame shaders depend only on (fb, load, resolve), not on the layer
+-    * or the store: cmd_get_frame_shaders() reads neither, and the DCDs it
+-    * emits are never patched afterwards. Without a resolve shader the main
+-    * set (fb.load, resolve) equals IR_FIRST's (fb.load, NULL) and IR_MIDDLE's
+-    * (spill.load, NULL) equals IR_LAST's (spill.load, resolve): no post-frame
+-    * DCD is emitted for either and modes[2] stays NEVER. Reuse them then;
+-    * otherwise build each IR pass's own set, once for all its layers. */
+    const bool reuse_spares = spare_fbd_reuse_enabled();
+-   const bool build_ir_sets = !reuse_spares || render->tiler != 0;
+    const struct pan_fb_frame_shaders main_frame_shaders =
+       fbd_info.frame_shaders;
+    const bool has_resolve_shader =
+@@ -2042,18 +1988,14 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+       static_assert(ARRAY_SIZE(cmdbuf->state.gfx.render.ir.fbds) == PANVK_IR_PASS_COUNT,
+                     "ir.fbds array size must match PANVK_IR_PASS_COUNT");
+ 
+-      if (!build_ir_sets) {
+-         cmdbuf->state.gfx.render.ir.fbds[ir_pass] = 0;
++      if (!render->ir.fbds_cpu[ir_pass])
+          continue;
+-      }
+ 
+-      struct pan_ptr ir_fbds =
+-         panvk_cmd_alloc_dev_mem(cmdbuf, desc, fbds_sz, fbds_alignment);
+-
+-      if (!ir_fbds.gpu)
+-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+-
+-      uint32_t ir_view_mask_temp = cmdbuf->state.gfx.render.view_mask;
++      const struct pan_ptr ir_fbds = {
++         .cpu = render->ir.fbds_cpu[ir_pass],
++         .gpu = render->ir.fbds[ir_pass],
++      };
++      uint32_t ir_view_mask_temp = render->view_mask;
+       const struct pan_fb_store *ir_store = ir_pass == PANVK_IR_LAST_PASS
+                                                ? &render->fb.store
+                                                : &render->fb.spill.store;
+@@ -2080,7 +2022,7 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+          } else if (ir_pass == PANVK_IR_LAST_PASS && !has_resolve_shader) {
+             fbd_info.frame_shaders = middle_frame_shaders;
+          } else {
+-            VkResult result = panvk_per_arch(cmd_get_frame_shaders)(
++            result = panvk_per_arch(cmd_get_frame_shaders)(
+                cmdbuf, fbd_info.fb, ir_load, ir_resolve,
+                &fbd_info.frame_shaders);
+             if (result != VK_SUCCESS)
+@@ -2100,7 +2042,7 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+          fbd_info.store = ir_store;
+ 
+          if (!reuse_spares) {
+-            VkResult result = panvk_per_arch(cmd_get_frame_shaders)(
++            result = panvk_per_arch(cmd_get_frame_shaders)(
+                cmdbuf, fbd_info.fb, ir_load, ir_resolve,
+                &fbd_info.frame_shaders);
+             if (result != VK_SUCCESS)
+@@ -2125,14 +2067,147 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+          /* Make sure all FBDs have the same flags. */
+          assert(new_fbd_flags == fbd_flags);
+       }
++   }
++
++   *fbd_flags_out = fbd_flags;
++#if PAN_ARCH == 10
++   *crc_fbd_flags_out = crc_fbd_flags;
++   *crc_rtd_flags_out = crc_rtd_flags;
++#endif
++   return VK_SUCCESS;
++}
++
++static inline void zs_untouched_skip_speculate(struct panvk_cmd_buffer *cmdbuf);
++
++static VkResult
++get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
++{
++   assert(cmdbuf->state.gfx.render.invalidate_inherited_ctx ||
++          !inherits_render_ctx(cmdbuf));
++
++   if (cmdbuf->state.gfx.render.fbds.gpu ||
++       !cmdbuf->state.gfx.render.layer_count)
++      return VK_SUCCESS;
++
++   zs_untouched_skip_speculate(cmdbuf);
++
++   uint32_t enabled_layer_count = calc_enabled_layer_count(cmdbuf);
++   uint32_t fbd_sz = calc_fbd_size(cmdbuf);
++   uint32_t fbds_sz = enabled_layer_count * fbd_sz;
++
++#if PAN_ARCH >= 14
++   const unsigned fbds_alignment = alignof(struct panvk_fb_layer_state);
++#else
++   const unsigned fbds_alignment = pan_alignment(FRAMEBUFFER);
++#endif
++   cmdbuf->state.gfx.render.fbds =
++      panvk_cmd_alloc_dev_mem(cmdbuf, desc, fbds_sz, fbds_alignment);
++   if (!cmdbuf->state.gfx.render.fbds.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
++
++   /* At this point, we should know sample count and the tile size should have
++    * been calculated */
++   assert(render->fb.layout.sample_count > 0);
++   assert(render->fb.layout.tile_size_px > 0);
++
++   bool simul_use =
++      cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
++
++   /* The only bit we patch in FBDs is the tiler pointer and CRC. If tiler
++    * is not involved (clear job) with no CRC, or if the update can happen in
++    * place (not simultaneous use of the command buffer), we can avoid the copy.
++    *
++    * According to VUID-VkSubmitInfo2KHR-commandBuffer-06192 and
++    * VUID-VkSubmitInfo2KHR-commandBuffer-06010, suspend/resume operations
++    * can't cross the vkQueueSubmit2() boundary, so no need to dynamically
++    * allocate descriptors in that case:
++    * "
++    *   If any commandBuffer member of an element of pCommandBufferInfos
++    *   contains any suspended render pass instances, they must be resumed by a
++    *   render pass instance later in submission order within
++    *   pCommandBufferInfos.
++    *
++    *   If any commandBuffer member of an element of pCommandBufferInfos
++    *   contains any resumed render pass instances, they must be suspended by a
++    *   render pass instance earlier in submission order within
++    *   pCommandBufferInfos.
++    * "
++    */
++#if PAN_ARCH == 10
++   struct pan_fb_crc_rt_info crc_info;
++   const bool has_crc_patch = render_get_crc_info(cmdbuf, &crc_info);
++   uint32_t crc_fbd_flags = 0;
++   uint32_t crc_rtd_flags = 0;
++#elif PAN_ARCH >= 11
++   const bool has_crc_patch = render_needs_crc_patch(cmdbuf);
++#endif
++   const bool copy_fbds =
++      simul_use && (cmdbuf->state.gfx.render.tiler || has_crc_patch);
++   const bool has_zs_crc_ext = render_needs_zs_crc_ext(cmdbuf);
++   struct pan_ptr fbds = cmdbuf->state.gfx.render.fbds;
++   uint32_t fbd_flags = 0;
++
++   render->fbd_emit.has_zs_crc_ext = has_zs_crc_ext;
++   render->fbd_emit.provoking_vertex_first = get_first_provoking_vertex(cmdbuf);
++
++#if PAN_ARCH >= 14
++   const unsigned fb_sz = ALIGN_POT(sizeof(struct panvk_fb_layer_state), 64);
++#else
++   const unsigned fb_sz = pan_size(FRAMEBUFFER);
++#endif
++
++   /* With no tiler context (render->tiler == 0: get_fb_descs() called from
++    * CmdEndRendering for a clear-only pass, which ends the pass), nothing is
++    * tiled and a tiler OOM can't happen, so skip the IR FBD sets. Any draw
++    * allocates the tiler context first (get_render_ctx()), so a pass with
++    * draws never gets here with tiler == 0. */
++   const bool build_ir_sets =
++      !spare_fbd_reuse_enabled() || render->tiler != 0;
++
++   for (uint32_t ir_pass = 0; ir_pass < PANVK_IR_PASS_COUNT; ir_pass++) {
++      render->ir.fbds[ir_pass] = 0;
++      render->ir.fbds_cpu[ir_pass] = NULL;
++
++      if (!build_ir_sets)
++         continue;
++
++      struct pan_ptr ir_fbds =
++         panvk_cmd_alloc_dev_mem(cmdbuf, desc, fbds_sz, fbds_alignment);
+ 
+-      cmdbuf->state.gfx.render.ir.fbds[ir_pass] = ir_fbds.gpu;
++      if (!ir_fbds.gpu)
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++      render->ir.fbds[ir_pass] = ir_fbds.gpu;
++      render->ir.fbds_cpu[ir_pass] = ir_fbds.cpu;
+    }
+ 
+-   /* Incremental-rendering loop might set fbd_info.load/store to spill nodes.
+-    * Set it back to the regular nodes here for CRC patching later. */
+-   fbd_info.load = &render->fb.load;
+-   fbd_info.store = &render->fb.store;
++#if PAN_ARCH == 10
++   VkResult result = emit_fb_desc_sets(cmdbuf, &fbd_flags, &crc_fbd_flags,
++                                       &crc_rtd_flags);
++#else
++   VkResult result = emit_fb_desc_sets(cmdbuf, &fbd_flags);
++#endif
++   if (result != VK_SUCCESS)
++      return result;
++
++   render->fbd_emit.fbd_flags = fbd_flags;
++
++#if PAN_ARCH >= 14
++   /* fbd_flags is unused on v14+. */
++   assert(!fbd_flags);
++#endif
++
++   /* The CRC patching below only needs the layout and the regular store. */
++   struct pan_fb_desc_info fbd_info = {
++      .fb = &render->fb.layout,
++      .load = &render->fb.load,
++      .store = &render->fb.store,
++   };
++
++   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_FRAGMENT);
++   invalidate_unselected_crc_rts(b, &fbd_info);
+ 
+    /* Wait for IR info push to complete */
+    cs_wait_slot(b, SB_ID(LS));
+@@ -2297,6 +2372,7 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+       /* If we don't know what provoking vertex mode the application wants yet,
+        * leave space to patch it later */
+       if (cmdbuf->state.gfx.render.first_provoking_vertex == U_TRISTATE_UNSET) {
++         struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+          uint32_t fbd_count = calc_enabled_layer_count(cmdbuf);
+          /* passed to fn_set_fbds_provoking_vertex */
+          struct cs_index fbd_count_reg = cs_scratch_reg32(b, 0);
+@@ -2321,6 +2397,256 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
+    return VK_SUCCESS;
+ }
+ 
++/* Untouched depth/stencil skip (compatibility channel).
++ *
++ * A depth or stencil aspect that is loaded (LOAD_OP_LOAD, or the forced
++ * preload of DONT_CARE/NONE + STORE_OP_NONE) or stored, but that nothing in
++ * the pass reads or writes, gets the same result without its preload and
++ * without its write-back:
++ *  - store DONT_CARE: the contents are undefined after the pass, and leaving
++ *    memory as it was is one of the allowed results;
++ *  - store STORE or NONE: the result must be the loaded contents, which is
++ *    what memory holds already. Not writing it back leaves every byte of the
++ *    plane, and any AFBC header of it, as it was. (Z/S planes have no CRC.)
++ * The incremental-rendering spills of that aspect are dropped with it: the
++ * memory copy stays valid through the IR passes, nothing in the tile buffer
++ * needs preserving.
++ *
++ * "Reads or writes" is kept conservative, from the state each draw (API or
++ * vk_meta, vkCmdClearAttachments included) is recorded with: depth: the depth
++ * test (depth writes need it) or the depth bounds test enabled, a bound
++ * fragment shader reading depth (input attachment, tile read) or
++ * rasterization-order depth access; stencil likewise with the stencil test.
++ * A vkCmdClearAttachments of the aspect and any vkCmdExecuteCommands in the
++ * pass count as touching it.
++ *
++ * Candidates are decided at CmdBeginRendering: separate (planar) Z/S only,
++ * no CLEAR load op (the store writes the clear), no resolve and no
++ * multisampled-render-to-single-sampled (both read the aspect or another
++ * image), no multiview, no suspend/resume (draws elsewhere), not a secondary
++ * continuing a render pass. Only v11/v12: v10 bakes FBD words into the CRC
++ * patch commands, and v13+ (HSR prepass) and v14 (layer state) aren't covered.
++ *
++ * Whether the pass touches an aspect is only known at CmdEndRendering, but
++ * the FBDs are emitted at its first draw. They are emitted with the
++ * candidates nothing has touched yet dropped (zs_untouched_skip_speculate()),
++ * which is the final answer for most passes. If a later draw touches a
++ * dropped aspect, CmdEndRendering puts its load/store back and writes the
++ * descriptors again in place (emit_fb_desc_sets()): the command stream only
++ * refers to them by address, and the tag, size and layout don't depend on
++ * the Z/S load/store (has_zs_crc_ext follows the formats). Nothing else
++ * recorded during the pass reads the Z/S load/store state.
++ *
++ * PANVK_NO_ZS_UNTOUCHED_SKIP=1 restores the old behaviour. */
++#define PANVK_ZS_SKIP_ARCH (PAN_ARCH == 11 || PAN_ARCH == 12)
++
++#if PANVK_ZS_SKIP_ARCH
++static bool
++zs_untouched_skip_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_ZS_UNTOUCHED_SKIP", false);
++
++   return !disabled;
++}
++
++static bool
++zs_untouched_skip_aspect_ok(const struct panvk_cmd_buffer *cmdbuf,
++                            const VkRenderingAttachmentInfo *att,
++                            const struct panvk_image_view *preload_iview,
++                            const struct pan_fb_load_target *load,
++                            const struct pan_fb_store_target *store)
++{
++   if (!att || att->imageView == VK_NULL_HANDLE)
++      return false;
++
++   VK_FROM_HANDLE(panvk_image_view, iview, att->imageView);
++   const struct panvk_image *img =
++      container_of(iview->vk.image, struct panvk_image, vk);
++
++   /* Interleaved Z/S share one store; ms2ss loads and stores go through
++    * another image; resolves read the aspect. */
++   if (panvk_image_is_interleaved_depth_stencil(img) || preload_iview ||
++       att->resolveMode != VK_RESOLVE_MODE_NONE)
++      return false;
++
++   /* A cleared aspect is written by its load op. */
++   if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR || pan_target_has_clear(load))
++      return false;
++
++   if (store->store && store->always)
++      return false;
++
++   /* Only aspects with something to drop. */
++   const bool border_load =
++      load->border_load == PAN_FB_LOAD_IMAGE &&
++      pan_fb_has_partial_tiles(&cmdbuf->state.gfx.render.fb.layout);
++
++   return load->in_bounds_load == PAN_FB_LOAD_IMAGE || border_load ||
++          store->store;
++}
++
++/* Drops (restore = false) or puts back (restore = true) the load, store and
++ * IR spills of aspects. */
++static void
++zs_untouched_skip_set(struct panvk_rendering_state *render, uint8_t aspects,
++                      bool restore)
++{
++   for (unsigned a = 0; a < 2; a++) {
++      const uint8_t bit =
++         a ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
++      struct pan_fb_load_target *load = a ? &render->fb.load.s
++                                          : &render->fb.load.z;
++      struct pan_fb_load_target *spill_load = a ? &render->fb.spill.load.s
++                                                : &render->fb.spill.load.z;
++      struct pan_fb_store_target *store = a ? &render->fb.store.s
++                                            : &render->fb.store.zs;
++      struct pan_fb_store_target *spill_store = a ? &render->fb.spill.store.s
++                                                  : &render->fb.spill.store.zs;
++
++      if (!(aspects & bit))
++         continue;
++
++      if (restore) {
++         assert(render->zs_skip.dropped & bit);
++         *load = render->zs_skip.saved[a].load;
++         *spill_load = render->zs_skip.saved[a].spill_load;
++         *store = render->zs_skip.saved[a].store;
++         *spill_store = render->zs_skip.saved[a].spill_store;
++         render->zs_skip.dropped &= ~bit;
++      } else {
++         assert(!(render->zs_skip.dropped & bit));
++         render->zs_skip.saved[a].load = *load;
++         render->zs_skip.saved[a].spill_load = *spill_load;
++         render->zs_skip.saved[a].store = *store;
++         render->zs_skip.saved[a].spill_store = *spill_store;
++         *load = (struct pan_fb_load_target){0};
++         *spill_load = (struct pan_fb_load_target){0};
++         *store = (struct pan_fb_store_target){0};
++         *spill_store = (struct pan_fb_store_target){0};
++         render->zs_skip.dropped |= bit;
++      }
++   }
++}
++#endif
++
++static void
++zs_untouched_skip_begin(struct panvk_cmd_buffer *cmdbuf,
++                        const VkRenderingInfo *info)
++{
++   struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
++
++   render->zs_skip.candidates = 0;
++   render->zs_skip.touched = 0;
++   render->zs_skip.dropped = 0;
++
++#if PANVK_ZS_SKIP_ARCH
++   if (!zs_untouched_skip_enabled() || inherits_render_ctx(cmdbuf) ||
++       info->viewMask ||
++       (info->flags &
++        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)))
++      return;
++
++   if (zs_untouched_skip_aspect_ok(cmdbuf, info->pDepthAttachment,
++                                   render->z_attachment.preload_iview,
++                                   &render->fb.load.z, &render->fb.store.zs))
++      render->zs_skip.candidates |= VK_IMAGE_ASPECT_DEPTH_BIT;
++
++   if (zs_untouched_skip_aspect_ok(cmdbuf, info->pStencilAttachment,
++                                   render->s_attachment.preload_iview,
++                                   &render->fb.load.s, &render->fb.store.s))
++      render->zs_skip.candidates |= VK_IMAGE_ASPECT_STENCIL_BIT;
++#else
++   (void)info;
++#endif
++}
++
++/* Marks the aspects the current draw state may read or write. Called for
++ * every draw recorded in the pass, API and vk_meta, before anything of it is
++ * recorded (so before the first draw emits the FBDs). */
++static inline void
++zs_untouched_skip_track(struct panvk_cmd_buffer *cmdbuf)
++{
++   struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
++
++   if (likely(!(render->zs_skip.candidates & ~render->zs_skip.touched)))
++      return;
++
++   const struct vk_dynamic_graphics_state *dyns =
++      &cmdbuf->vk.dynamic_graphics_state;
++   const struct panvk_shader_variant *fs =
++      panvk_shader_only_variant(cmdbuf->state.gfx.fs.shader);
++   uint8_t touched = 0;
++
++   if (dyns->ds.depth.test_enable || dyns->ds.depth.bounds_test.enable ||
++       (dyns->rasterization_order_access & VK_IMAGE_ASPECT_DEPTH_BIT) ||
++       (fs && z_attachment_read(fs, &dyns->ial)))
++      touched |= VK_IMAGE_ASPECT_DEPTH_BIT;
++
++   if (dyns->ds.stencil.test_enable ||
++       (dyns->rasterization_order_access & VK_IMAGE_ASPECT_STENCIL_BIT) ||
++       (fs && s_attachment_read(fs, &dyns->ial)))
++      touched |= VK_IMAGE_ASPECT_STENCIL_BIT;
++
++   render->zs_skip.touched |= touched;
++}
++
++/* get_fb_descs(), before the first emission: drop the candidates nothing
++ * has touched so far. */
++static inline void
++zs_untouched_skip_speculate(struct panvk_cmd_buffer *cmdbuf)
++{
++#if PANVK_ZS_SKIP_ARCH
++   struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
++   const uint8_t drop = render->zs_skip.candidates & ~render->zs_skip.touched &
++                        ~render->zs_skip.dropped;
++
++   if (unlikely(drop) && !inherits_render_ctx(cmdbuf))
++      zs_untouched_skip_set(render, drop, false);
++#endif
++}
++
++/* At CmdEndRendering of a pass that isn't suspending, before its fragment
++ * job is issued: settle the dropped aspects on the untouched candidates. */
++static VkResult
++zs_untouched_skip_end(struct panvk_cmd_buffer *cmdbuf)
++{
++#if PANVK_ZS_SKIP_ARCH
++   struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
++   const uint8_t final = inherits_render_ctx(cmdbuf)
++                            ? 0
++                            : render->zs_skip.candidates &
++                                 ~render->zs_skip.touched;
++   const uint8_t restore = render->zs_skip.dropped & ~final;
++   const uint8_t drop = final & ~render->zs_skip.dropped;
++
++   render->zs_skip.candidates = 0;
++
++   if (likely(!restore && !drop))
++      return VK_SUCCESS;
++
++   zs_untouched_skip_set(render, restore, true);
++   zs_untouched_skip_set(render, drop, false);
++
++   /* No descriptors yet (no draw): CmdEndRendering emits them from this
++    * state if the pass clears something, else the pass issues nothing. */
++   if (!render->fbds.gpu)
++      return VK_SUCCESS;
++
++   uint32_t fbd_flags;
++   VkResult result = emit_fb_desc_sets(cmdbuf, &fbd_flags);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* The FBD pointer tag is already in the command stream. */
++   assert(fbd_flags == render->fbd_emit.fbd_flags);
++#endif
++
++   return VK_SUCCESS;
++}
++
+ static bool
+ get_first_provoking_vertex(struct panvk_cmd_buffer *cmdbuf)
+ {
+@@ -5968,6 +6294,8 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info draw)
+       raster_vs_variant(cmdbuf, draw.gpu_prerast_generated);
+    VkResult result;
+ 
++   zs_untouched_skip_track(cmdbuf);
++
+    /* If there's no vertex shader, we can skip the draw. With tessellation,
+     * the TES rasterizes and the VS may be empty.
+     */
+@@ -6524,6 +6852,8 @@ panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
+       state->render.fb.nr_samples = suspended_sample_count;
+    }
+ 
++   zs_untouched_skip_begin(cmdbuf, pRenderingInfo);
++
+    /* Renderpass lowering can fold an initial layout transition into
+     * CmdBeginRendering() and report the old layout through
+     * VkRenderingAttachmentInitialLayoutInfoMESA instead of an image barrier.
+@@ -7536,6 +7866,10 @@ panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
+       /* If no draw was performed, we should ensure sample count is valid and that we emit tile size */
+       panvk_per_arch(cmd_select_tile_size)(cmdbuf);
+ 
++      result = zs_untouched_skip_end(cmdbuf);
++      if (result != VK_SUCCESS)
++         return;
++
+       const struct pan_fb_load *fb_load = &cmdbuf->state.gfx.render.fb.load;
+       bool clear = fb_load->z.in_bounds_load == PAN_FB_LOAD_CLEAR ||
+                    fb_load->s.in_bounds_load == PAN_FB_LOAD_CLEAR;
+@@ -7654,6 +7988,7 @@ panvk_per_arch(cmd_draw_fullscreen)(struct vk_command_buffer *cmd,
+    struct panvk_draw_info draw = {0};
+    struct panvk_cmd_buffer *cmdbuf =
+       container_of(cmd, struct panvk_cmd_buffer, vk);
++   zs_untouched_skip_track(cmdbuf);
+    cmdbuf->state.gfx.fs.required =
+       fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
+    struct vk_rasterization_state rs = cmdbuf->vk.dynamic_graphics_state.rs;
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index ac9db488..dd31e93c 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -145,7 +145,35 @@ struct panvk_rendering_state {
+ 
+    struct {
+       uint64_t fbds[3];
++      /* CPU mappings of fbds[], NULL for a set that wasn't built. */
++      void *fbds_cpu[3];
+    } ir;
++
++   /* What get_fb_descs() emitted the descriptors with, so CmdEndRendering
++    * can write them again in place (emit_fb_desc_sets()). */
++   struct {
++      bool provoking_vertex_first;
++      bool has_zs_crc_ext;
++      uint32_t fbd_flags;
++   } fbd_emit;
++
++   /* Untouched depth/stencil load/store skip (zs_untouched_skip_end()), in
++    * VK_IMAGE_ASPECT_DEPTH_BIT / VK_IMAGE_ASPECT_STENCIL_BIT. */
++   struct {
++      /* Aspects whose load and store can be dropped if nothing in the pass
++       * touches them. Set at CmdBeginRendering. */
++      uint8_t candidates;
++      /* Aspects a draw, a clear or a secondary of the pass may have read or
++       * written. */
++      uint8_t touched;
++      /* Aspects dropped from fb.load/store/spill (in the FBDs if emitted). */
++      uint8_t dropped;
++      /* Their targets before the drop, [0] depth, [1] stencil. */
++      struct {
++         struct pan_fb_load_target load, spill_load;
++         struct pan_fb_store_target store, spill_store;
++      } saved[2];
++   } zs_skip;
+ #endif
+ };
+ 
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index b6fb4505..aa41307c 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -352,6 +352,16 @@ panvk_per_arch(CmdClearAttachments)(VkCommandBuffer commandBuffer,
+          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    }
+ 
++#if PAN_ARCH >= 10
++   /* The clear draws below would mark these too; keep the pass's
++    * depth/stencil loads and stores regardless (zs_untouched_skip_end()). */
++   for (uint32_t i = 0; i < attachmentCount; i++) {
++      cmdbuf->state.gfx.render.zs_skip.touched |=
++         pAttachments[i].aspectMask &
++         (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
++   }
++#endif
++
+    meta_gfx_start(cmdbuf, &save);
+ #if PAN_ARCH >= 9
+    /* CmdClearAttachments IS affected by conditional rendering, so restore
+-- 
+2.55.0
+
