@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:29:00 -0400
+Subject: [PATCH] panvk/csf: bound the fragment jobs of an attachment-less pass
+ to its draws
+
+vkd3d-proton gives a pass without RTV and DSV a render area of
+maxFramebufferWidth x maxFramebufferHeight and maxFramebufferLayers layers:
+65536 x 65536 x 256 here. Since such passes no longer lose the device, they
+take 2.9 s of GPU time each, with five 3-vertex draws into a 1x100
+viewport (drawcpu noatt): a fragment job walks every tile of its bounding
+box, 12 ms per layer at 65536x65536, although no tile outside the draws'
+scissor boxes gets a fragment.
+
+A pass with no attachment loads and stores nothing, so the side effects of
+its fragments are all it does, and fragments only exist inside the box a
+draw is rasterized with. Track the union of those boxes from the dynamic
+state at each draw: the scissor, intersected with the viewport before v12
+(the SCISSOR_BOX register holds their intersection there), rounded
+outwards, and use it, clamped to the render area, as the fragment jobs'
+bounding box. Draws whose prerast shader picks one of several viewports
+(their box is the framebuffer), vk_meta rectangle draws and
+vkCmdExecuteCommands stop the tracking: those passes keep the full render
+area. A secondary continuing a render pass never tracks. Passes with an
+attachment are unchanged.
+
+drawcpu noatt at 65536x65536x256 goes from 2,910 ms to 8 ms (5 draws), and
+to 1.1 s when the draws' boxes spread over 48000x36000; the atomic counts
+are the same. Passes with attachments are unchanged (ircheck checksums
+identical).
+
+PANVK_NO_NOATT_FRAG_BBOX=1 restores the full render area.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: GPU time: the fragment jobs of a pass without attachments are bounded to the union of its draws' scissor boxes instead of the render area (vkd3d-proton's 65536x65536 x 256-layer passes: 2.9 s -> 8.2 ms of GPU time); falls back to the full area for multi-viewport prerast, ClearAttachments and ExecuteCommands; PANVK_NO_NOATT_FRAG_BBOX=1 disables
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/043
+Validation test: native: moved and flipped-viewport draws give the right atomic count; draws spread over 48000x36000 at 256 layers correct; PanProbe 38/38 x2; ircheck checksums identical; combined build noatt2.so (98a13fc24329, rg477m/001-044): vkd3d-proton 2.14.1 full suite 289 -> 306 PASS vs rg477m/042 (17 of the 20 B19 timeouts pass, the 2 ROV tests now fail instead of hanging, 1 stream-output test still times out; test_integer_blending_pipeline_state's start-up crash is B20: 6/20 on both builds), suite time 50 -> 13 min; DXVK unchanged: Hades renders, Jupiter Hell tutorial 48.5 fps, Serious Sam D3D11 58.3 fps (FPS limiter off, quietd Stock)
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c |   3 +
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   | 118 +++++++++++++++++-
+ src/panfrost/vulkan/panvk_cmd_draw.h          |  10 ++
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c       |   3 +
+ 4 files changed, 128 insertions(+), 6 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index e2d7b69f..a74cab6b 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -1759,6 +1759,9 @@ panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
+     * stores of the current pass (zs_untouched_skip_end()). */
+    primary->state.gfx.render.zs_skip.touched |=
+       VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++   /* Nor are their boxes: an attachment-less pass keeps the full fragment
++    * area (draw_bbox_fragment_area()). */
++   primary->state.gfx.render.draw_bbox.track = false;
+ 
+    /* Write out any pending seqno changes to registers before calling
+     * secondary command buffers. */
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index fa500adc..153c387c 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -1287,6 +1287,108 @@ prepare_vp(struct panvk_cmd_buffer *cmdbuf)
+ }
+ #endif
+ 
++/* An attachment-less pass (vkd3d-proton: no RTV and no DSV) loads and stores
++ * nothing: its only effects are the side effects of the fragments its draws
++ * rasterize, and those only exist inside the box prepare_vp() gives the
++ * hardware for the draw. vkd3d-proton gives such a pass a render area of
++ * maxFramebufferWidth x maxFramebufferHeight, and a fragment job walks every
++ * tile of its bounding box: 12 ms per layer at 65536x65536, 2.9 s for the 256
++ * layers vkd3d-proton asks for. The fragment jobs of such a pass are bounded
++ * to the union of its draws' boxes instead (draw_bbox_fragment_area()).
++ *
++ * The box is the scissor, intersected with the viewport before v12 (the
++ * SCISSOR_BOX register holds both there), rounded outwards. Tracking stops
++ * for a draw whose prerast shader selects among several viewports (its box
++ * is the framebuffer), vk_meta's rectangle draws (cmd_draw_fullscreen:
++ * vkCmdClearAttachments) and vkCmdExecuteCommands; the fragment jobs then
++ * cover the render area as before. Barrier draws
++ * (cmd_run_fullscreen with ignore_scissor) have no fragment shader: tiles
++ * without fragments of the pass's draws don't need them.
++ *
++ * PANVK_NO_NOATT_FRAG_BBOX=1 restores the full render area. */
++static bool
++noatt_frag_bbox_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_NOATT_FRAG_BBOX", false);
++
++   return !disabled;
++}
++
++static void
++draw_bbox_add_draw(struct panvk_cmd_buffer *cmdbuf)
++{
++   struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
++   const struct vk_viewport_state *vp = &cmdbuf->vk.dynamic_graphics_state.vp;
++
++   if (!render->draw_bbox.track)
++      return;
++
++   if (panvk_prerast_viewport_shader(&cmdbuf->state.gfx) != NULL &&
++       vp->viewport_count > 1) {
++      render->draw_bbox.track = false;
++      return;
++   }
++
++   /* Exclusive maximums until the end. */
++   const VkRect2D *scissor = &vp->scissors[0];
++   int64_t minx = scissor->offset.x;
++   int64_t miny = scissor->offset.y;
++   int64_t maxx = minx + scissor->extent.width;
++   int64_t maxy = miny + scissor->extent.height;
++
++#if PAN_ARCH < 12
++   const VkViewport *viewport = &vp->viewports[0];
++   const float vx0 = viewport->x, vx1 = viewport->x + viewport->width;
++   const float vy0 = MIN2(viewport->y, viewport->y + viewport->height);
++   const float vy1 = MAX2(viewport->y, viewport->y + viewport->height);
++
++   minx = MAX2(minx, (int64_t)floorf(vx0));
++   miny = MAX2(miny, (int64_t)floorf(vy0));
++   maxx = MIN2(maxx, (int64_t)ceilf(vx1));
++   maxy = MIN2(maxy, (int64_t)ceilf(vy1));
++#endif
++
++   /* prepare_vp() keeps one pixel of an empty box, keep it too. */
++   maxx = MAX2(maxx - 1, minx);
++   maxy = MAX2(maxy - 1, miny);
++
++   const struct pan_fb_bbox box = {
++      .min_x = CLAMP(minx, 0, UINT16_MAX),
++      .min_y = CLAMP(miny, 0, UINT16_MAX),
++      .max_x = CLAMP(maxx, 0, UINT16_MAX),
++      .max_y = CLAMP(maxy, 0, UINT16_MAX),
++   };
++
++   if (!render->draw_bbox.any) {
++      render->draw_bbox.px = box;
++      render->draw_bbox.any = true;
++   } else {
++      struct pan_fb_bbox *u = &render->draw_bbox.px;
++
++      u->min_x = MIN2(u->min_x, box.min_x);
++      u->min_y = MIN2(u->min_y, box.min_y);
++      u->max_x = MAX2(u->max_x, box.max_x);
++      u->max_y = MAX2(u->max_y, box.max_y);
++   }
++}
++
++/* The bounding box of the fragment jobs of the current render context. */
++static struct pan_fb_bbox
++draw_bbox_fragment_area(struct panvk_cmd_buffer *cmdbuf)
++{
++   const struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
++   const struct pan_fb_bbox area = render->fb.layout.tiling_area_px;
++
++   if (!render->draw_bbox.track || !render->draw_bbox.any ||
++       render->bound_attachments || inherits_render_ctx(cmdbuf))
++      return area;
++
++   return pan_fb_bbox_clamp(render->draw_bbox.px, area);
++}
++
+ static void
+ prepare_tiler_primitive_size(struct panvk_cmd_buffer *cmdbuf,
+                              const struct panvk_draw_info *draw)
+@@ -3728,6 +3830,8 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf,
+       prepare_tiler_primitive_size(cmdbuf, draw);
+    }
+ 
++   draw_bbox_add_draw(cmdbuf);
++
+    clear_dirty_after_draw(cmdbuf);
+    return VK_SUCCESS;
+ }
+@@ -6984,6 +7088,9 @@ panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
+ 
+    zs_untouched_skip_begin(cmdbuf, pRenderingInfo);
+ 
++   state->render.draw_bbox.track =
++      !state->render.bound_attachments && noatt_frag_bbox_enabled();
++
+    /* Renderpass lowering can fold an initial layout transition into
+     * CmdBeginRendering() and report the old layout through
+     * VkRenderingAttachmentInitialLayoutInfoMESA instead of an image barrier.
+@@ -7542,7 +7649,7 @@ cs_emit_static_fragment_state(struct cs_builder *b,
+    const struct pan_fb_bbox fb_area_px =
+       pan_fb_bbox_from_xywh(0, 0, fb->width_px, fb->height_px);
+    const struct pan_fb_bbox bbox_px =
+-      pan_fb_bbox_clamp(fb->tiling_area_px, fb_area_px);
++      pan_fb_bbox_clamp(draw_bbox_fragment_area(cmdbuf), fb_area_px);
+ 
+    assert(pan_fb_bbox_is_valid(fb->tiling_area_px));
+ 
+@@ -7614,13 +7721,11 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
+ #if PAN_ARCH >= 14
+       cs_emit_static_fragment_state(b, cmdbuf);
+ #else
+-      const struct pan_fb_layout *fb = &cmdbuf->state.gfx.render.fb.layout;
++      const struct pan_fb_bbox frag_area = draw_bbox_fragment_area(cmdbuf);
+       cs_move32_to(b, cs_sr_reg32(b, FRAGMENT, BBOX_MIN),
+-                   pack_32_2x16(fb->tiling_area_px.min_x,
+-                                fb->tiling_area_px.min_y));
++                   pack_32_2x16(frag_area.min_x, frag_area.min_y));
+       cs_move32_to(b, cs_sr_reg32(b, FRAGMENT, BBOX_MAX),
+-                   pack_32_2x16(fb->tiling_area_px.max_x,
+-                                fb->tiling_area_px.max_y));
++                   pack_32_2x16(frag_area.max_x, frag_area.max_y));
+ #endif
+    }
+ 
+@@ -8119,6 +8224,7 @@ panvk_per_arch(cmd_draw_fullscreen)(struct vk_command_buffer *cmd,
+    struct panvk_cmd_buffer *cmdbuf =
+       container_of(cmd, struct panvk_cmd_buffer, vk);
+    zs_untouched_skip_track(cmdbuf);
++   cmdbuf->state.gfx.render.draw_bbox.track = false;
+    cmdbuf->state.gfx.fs.required =
+       fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
+    struct vk_rasterization_state rs = cmdbuf->vk.dynamic_graphics_state.rs;
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index 8d219715..32319d51 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -149,6 +149,16 @@ struct panvk_rendering_state {
+       void *fbds_cpu[3];
+    } ir;
+ 
++   /* Attachment-less pass: the union of the scissor boxes its draws were
++    * recorded with, which bounds its fragment jobs (draw_bbox_fragment_area()
++    * in csf/panvk_vX_cmd_draw.c). track is set at CmdBeginRendering and
++    * cleared when a draw's box isn't known on the CPU. */
++   struct {
++      bool track;
++      bool any;
++      struct pan_fb_bbox px;
++   } draw_bbox;
++
+    /* What get_fb_descs() emitted the descriptors with, so CmdEndRendering
+     * can write them again in place (emit_fb_desc_sets()). */
+    struct {
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 0b6487c1..b4a3c932 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -616,6 +616,9 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
+    memset(&render->z_attachment, 0, sizeof(render->z_attachment));
+    memset(&render->s_attachment, 0, sizeof(render->s_attachment));
+    memset(&render->fb, 0, sizeof(render->fb));
++#if PAN_ARCH >= 10
++   memset(&render->draw_bbox, 0, sizeof(render->draw_bbox));
++#endif
+    render->bound_attachments = 0;
+ 
+    const VkMultisampledRenderToSingleSampledInfoEXT *ms2ss_info =
+-- 
+2.55.0
+
