@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 13:19:26 -0400
+Subject: [PATCH] panvk/csf: don't re-upload push uniforms for a push that
+ changes no bytes
+
+vkCmdPushConstants flagged VS/FS (or compute) PUSH_UNIFORMS dirty on every
+call, so the next draw re-packed the stage's FAUs into a new push-uniform
+buffer and rewrote its FAU register. DXVK pushes the same constants again
+after most pipeline changes: in Arkham Asylum (DXVK 1.10.3, D3D9) 10,039 of
+10,182 pushes per second wrote the bytes already stored.
+
+The upload is rebuilt from the push-constant storage and the sysvals, and
+the sysvals have their own dirty tracking. If a push leaves the storage
+unchanged, a stage whose dirty bit is clear and whose last upload was made
+from the current storage would get identical push uniforms, so its bit can
+stay clear. The storage is shared by all stages: a push that changes bytes
+for some stages leaves the others' uploads made from the old bytes, so they
+are recorded in stale_stages and an identical push still flags them. All
+stages start stale at vkBeginCommandBuffer, after vkCmdExecuteCommands
+(secondaries pointed the FAU registers at their own uploads; the compute
+dirty state isn't reset there) and after meta operations.
+
+PANVK_NO_PC_SAME_SKIP=1 flags the stages on every push again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: CPU: a vkCmdPushConstants that changes no bytes no longer re-uploads push uniforms for stages whose last upload used the current bytes (Arkham: 10,039 of 10,182 pushes/s identical); PANVK_NO_PC_SAME_SKIP=1 disables
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/039 (stacked)
+Validation test: drawcpu arkham mix with rg477m/041 667.4 -> 646.9 ns/draw (-3.1%), dxvk pattern -5.1%; DC_CHECKSUM colour identical on/off/base (arkham b590c25518c74c87, dxvk e5f8d186277b62c2); PanProbe 38/38 x2; combined build d6.so (443dfbaf1028, rg477m/023-041): 16-game boot sweep 2026-10-25 in quietd Stock mode (boot check, FPS limiter on): all 16 boot to their known states (Hades, Arkham, Serious Sam, Jupiter Hell, Risk of Rain 2, Moonlighter, Megabonk, Portal 2, Gladius, Crysis 3 Remastered render; Factorio and Ashes menus; Descenders; Tomb Raider ToS screen; Doom 3 BFG white window; Metro 2033 black), 0 GPU faults; uncapped gameplay A-B-B-A vs compat (quietd Stock, FPS limiter off): Hades hub at 1255 MHz 224.7 vs 224.9 fps (n=4 each, GPU-bound), Jupiter Hell tutorial level 48.5 vs 48.6 fps (n=4 each), Serious Sam bot benchmark D3D11 57.0 vs 58.9 fps (n=2 each), Risk of Rain 2 stage 1 27.6 vs 28.8 fps (n=5 each, random maps; the B17 memory guard ended 1 of 6 runs in each arm); Arkham Asylum 20-round interleaved gameplay gate 2026-10-25/26 (quietd Stock, FPS limiter off), base rg477m/023-037 vs this: gameplay fps 36.24 vs 36.25 (n=17 each), load failures (B5 signatures: appUncompressMemory/BulkData assertions, pure-virtual dialog) 2/19 vs 3/20 (B5 base rate: stock 7/38, ours 16/138), 0 GPU faults
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h    | 14 ++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c |  9 +++
+ src/panfrost/vulkan/panvk_cmd_push_constant.h | 14 ++++
+ src/panfrost/vulkan/panvk_vX_cmd_meta.c       |  4 ++
+ .../vulkan/panvk_vX_cmd_push_constant.c       | 67 +++++++++++++++----
+ 5 files changed, 96 insertions(+), 12 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index ec996fa2..41132d25 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -802,6 +802,20 @@ panvk_desc_split_enabled(void)
+    return !disabled;
+ }
+ 
++/* vkCmdPushConstants writing the bytes already stored leaves the push
++ * uniforms clean (panvk_per_arch(CmdPushConstants2KHR)).
++ * PANVK_NO_PC_SAME_SKIP=1 flags them dirty on every push again. */
++static inline bool
++panvk_pc_same_skip_enabled(void)
++{
++   static int disabled = -1;
++
++   if (disabled < 0)
++      disabled = debug_get_bool_option("PANVK_NO_PC_SAME_SKIP", false);
++
++   return !disabled;
++}
++
+ /* Barrier sync elision, primary command buffers only (see emit_barrier_csf()).
+  * PANVK_NO_SYNC_ELISION=1 turns it off. */
+ static inline bool
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+index f37877ef..e2d7b69f 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+@@ -1675,6 +1675,10 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
+ 
+    panvk_per_arch(cmd_inherit_render_state)(cmdbuf, pBeginInfo);
+ 
++   /* No stage has uploaded push uniforms yet: an identical push must not
++    * skip the dirty bit (panvk_per_arch(CmdPushConstants2KHR)). */
++   cmdbuf->state.push_constants.stale_stages = PANVK_PUSH_STAGE_ALL;
++
+    if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+       const VkCommandBufferInheritanceConditionalRenderingInfoEXT *cond_info =
+          vk_find_struct_const(
+@@ -1732,6 +1736,11 @@ panvk_cmd_invalidate_state(struct panvk_cmd_buffer *cmdbuf)
+ 
+    vk_dynamic_graphics_state_dirty_all(&cmdbuf->vk.dynamic_graphics_state);
+    gfx_state_set_all_dirty(cmdbuf);
++
++   /* The secondaries pointed the FAU registers at their own push uniforms,
++    * compute ones included (the compute dirty state is not reset here): the
++    * next push of each stage must flag it, even with unchanged bytes. */
++   cmdbuf->state.push_constants.stale_stages = PANVK_PUSH_STAGE_ALL;
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+diff --git a/src/panfrost/vulkan/panvk_cmd_push_constant.h b/src/panfrost/vulkan/panvk_cmd_push_constant.h
+index a8088b4b..a193579f 100644
+--- a/src/panfrost/vulkan/panvk_cmd_push_constant.h
++++ b/src/panfrost/vulkan/panvk_cmd_push_constant.h
+@@ -15,8 +15,22 @@ struct panvk_shader_variant;
+ 
+ #define MAX_PUSH_CONSTANTS_SIZE 256
+ 
++/* Push-constant consumers whose uploaded push uniforms the identical-push
++ * skip tracks (CSF, panvk_per_arch(CmdPushConstants2KHR)). */
++#define PANVK_PUSH_STAGE_VS  BITFIELD_BIT(0) /* VS, TCS, TES, GS */
++#define PANVK_PUSH_STAGE_FS  BITFIELD_BIT(1)
++#define PANVK_PUSH_STAGE_CS  BITFIELD_BIT(2)
++#define PANVK_PUSH_STAGE_ALL BITFIELD_MASK(3)
++
+ struct panvk_push_constant_state {
+    uint64_t data[MAX_PUSH_CONSTANTS_SIZE / sizeof(uint64_t)];
++
++   /* PANVK_PUSH_STAGE_* whose last push-uniform upload may not match data[]
++    * although their PUSH_UNIFORMS dirty bit is clear: data[] was changed by
++    * a push that did not name them, or nothing is known (command buffer
++    * begin, after secondaries, after a meta operation). An identical push
++    * only skips the dirty bit for stages not in this mask. */
++   uint32_t stale_stages;
+ };
+ 
+ VkResult panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index aa41307c..a45c6c25 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -146,6 +146,8 @@ meta_compute_end(struct panvk_cmd_buffer *cmdbuf,
+    }
+ 
+    cmdbuf->state.push_constants = save_ctx->push_constants;
++   /* The meta pushes may have changed what any stage uploaded last. */
++   cmdbuf->state.push_constants.stale_stages = PANVK_PUSH_STAGE_ALL;
+    compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
+ 
+    cmdbuf->state.compute.shader = save_ctx->cs.shader;
+@@ -249,6 +251,8 @@ meta_gfx_end(struct panvk_cmd_buffer *cmdbuf,
+    }
+ 
+    cmdbuf->state.push_constants = save_ctx->push_constants;
++   /* The meta pushes may have changed what any stage uploaded last. */
++   cmdbuf->state.push_constants.stale_stages = PANVK_PUSH_STAGE_ALL;
+    gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+    gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
+ 
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+index 7c762bb4..4f03bed4 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+@@ -95,27 +95,70 @@ panvk_per_arch(cmd_prepare_compute_push_uniforms)(
+                                 (uint64_t *)&cmdbuf->state.compute.sysvals);
+ }
+ 
+-VKAPI_ATTR void VKAPI_CALL
+-panvk_per_arch(CmdPushConstants2KHR)(
+-   VkCommandBuffer commandBuffer,
+-   const VkPushConstantsInfoKHR *pPushConstantsInfo)
++static uint32_t
++push_stages(VkShaderStageFlags stages)
+ {
+-   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++   uint32_t mask = 0;
+ 
+-   if (pPushConstantsInfo->stageFlags &
++   if (stages &
+        (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+         VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
+         VK_SHADER_STAGE_GEOMETRY_BIT))
+-      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
++      mask |= PANVK_PUSH_STAGE_VS;
++   if (stages & VK_SHADER_STAGE_FRAGMENT_BIT)
++      mask |= PANVK_PUSH_STAGE_FS;
++   if (stages & VK_SHADER_STAGE_COMPUTE_BIT)
++      mask |= PANVK_PUSH_STAGE_CS;
+ 
+-   if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_FRAGMENT_BIT)
+-      gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
++   return mask;
++}
+ 
+-   if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
++static void
++push_stages_set_dirty(struct panvk_cmd_buffer *cmdbuf, uint32_t mask)
++{
++   if (mask & PANVK_PUSH_STAGE_VS)
++      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
++   if (mask & PANVK_PUSH_STAGE_FS)
++      gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
++   if (mask & PANVK_PUSH_STAGE_CS)
+       compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
++}
+ 
+-   uint8_t *data =
+-      (uint8_t *)cmdbuf->state.push_constants.data + pPushConstantsInfo->offset;
++VKAPI_ATTR void VKAPI_CALL
++panvk_per_arch(CmdPushConstants2KHR)(
++   VkCommandBuffer commandBuffer,
++   const VkPushConstantsInfoKHR *pPushConstantsInfo)
++{
++   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++   struct panvk_push_constant_state *pc = &cmdbuf->state.push_constants;
++   const uint32_t stages = push_stages(pPushConstantsInfo->stageFlags);
++   uint8_t *data = (uint8_t *)pc->data + pPushConstantsInfo->offset;
++
++#if PAN_ARCH >= 10
++   /* DXVK pushes the same constants again on most pipeline changes. The
++    * upload a stage's FAU register points at is rebuilt from data[] (and the
++    * sysvals, which have their own dirty tracking) only when its
++    * PUSH_UNIFORMS bit is set. If the bytes don't change, a stage whose bit
++    * is clear and whose upload was made from the current data[] (not in
++    * stale_stages) would get the same push uniforms again: leave its bit
++    * alone. Stages in stale_stages are flagged as before.
++    */
++   if (panvk_pc_same_skip_enabled()) {
++      if (!memcmp(data, pPushConstantsInfo->pValues,
++                  pPushConstantsInfo->size)) {
++         const uint32_t dirty = stages & pc->stale_stages;
++
++         push_stages_set_dirty(cmdbuf, dirty);
++         pc->stale_stages &= ~dirty;
++         return;
++      }
++
++      /* The named stages re-upload from the new data[]; the others keep
++       * uploads made from the old bytes. */
++      pc->stale_stages = PANVK_PUSH_STAGE_ALL & ~stages;
++   }
++#endif
+ 
++   push_stages_set_dirty(cmdbuf, stages);
+    memcpy(data, pPushConstantsInfo->pValues, pPushConstantsInfo->size);
+ }
+-- 
+2.55.0
+
