@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:16:25 -0400
+Subject: [PATCH] panvk/csf: fit the bin pointers of all layers of a tiler
+ context in one heap chunk
+
+A layered pass at a large framebuffer size loses the device: kbase logs
+"Queue group to be terminated, couldn't handle the OoM event". vkd3d-proton
+hits it with every pass that has no RTV or DSV: it sets renderArea to
+maxFramebufferWidth x maxFramebufferHeight and layerCount to
+maxFramebufferLayers (65536 x 65536 x 256 here), so 20 of its 2.14.1 tests
+(draw_uav_only, null_rtv, the atomic tests, ...) time out. Upstream PanVK
+does the same.
+
+On the device (G615, drawcpu noatt: zero attachments, five 3-vertex draws
+with fragment atomics) it fails from 3 layers at 4096x4096 and from 8
+layers at 4096x4096 down to 2048x2048 passing; 1 and 2 layers pass at any
+size, up to 65536x65536. Raising the heap maximum from 400 to 4096 chunks
+doesn't help (the group is terminated after 1 s instead of 0.1 s), and 8
+chunks are enough for 2 layers. With PANVK_DEBUG=trace the heap top moves
+down by DIV_ROUND_UP(bins, 8) * 8 * 16 bytes per layer of the tiler
+context, for every layer at once (349,568 bytes per layer at 4096x4096,
+mask 0x1fe). Three layers need 1,048,704 bytes, more than a 1 MiB chunk
+minus its 64-byte header holds, so every chunk the OOM handler links is too
+small as well, until the heap reaches its maximum.
+
+The hierarchy mask budget was the whole chunk per tiler context, counted
+at 8 bytes per bin, which keeps one layer under half a chunk but not three.
+Count 16 bytes per bin on v10+ and divide the chunk between the layers of a
+tiler context (up to MAX_LAYERS_PER_TILER_DESC = 8 on v10/v11). Passes with
+one or two layers get the same mask as before; larger layered passes drop
+their finest bin levels until the layers fit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: GPU hang fix: layered passes (3+ layers at ~3.6k px and up) lost the device with a tiler heap OOM kbase can't recover from (no incremental rendering on uAPI 1.21): the v10+ tiler takes 16 bytes per bin (counted as 8) and the bin pointers of all layers of a tiler context from one 1 MiB chunk; count 16 B/bin and split the chunk budget between the layers. vkd3d-proton hits it with every pass without RTV/DSV (renderArea = max framebuffer size, 256 layers)
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: applies after rg477m/042; pan_desc.c change also applies to gallium panfrost v10/v11 (only when the budget is the limit)
+Validation test: native repro (drawcpu noatt: no attachments, fragment atomics, 5 draws): device lost from 3 layers at 4096x4096 on rg477m/042, all 12 points of 1/2/3/8/256 layers x 2048..65536 px PASS (500/500) with no kbase OoM; PanProbe 38/38; ircheck colour/depth checksums identical; combined build noatt2.so (98a13fc24329, rg477m/001-044): vkd3d-proton 2.14.1 full suite 289 -> 306 PASS vs rg477m/042 (17 of the 20 B19 timeouts pass, the 2 ROV tests now fail instead of hanging, 1 stream-output test still times out; test_integer_blending_pipeline_state's start-up crash is B20: 6/20 on both builds), suite time 50 -> 13 min; DXVK unchanged: Hades renders, Jupiter Hell tutorial 48.5 fps, Serious Sam D3D11 58.3 fps (FPS limiter off, quietd Stock)
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/lib/pan_desc.c                 |  7 ++++++-
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c | 13 +++++++++++--
+ 2 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/lib/pan_desc.c b/src/panfrost/lib/pan_desc.c
+index d213c304..70ca15f5 100644
+--- a/src/panfrost/lib/pan_desc.c
++++ b/src/panfrost/lib/pan_desc.c
+@@ -1729,7 +1729,12 @@ static uint32_t
+ pan_calc_bins_pointer_size(uint32_t width, uint32_t height, uint32_t tile_size,
+                            uint32_t hierarchy_mask)
+ {
+-   const uint32_t bin_ptr_size = PAN_ARCH >= 12 ? 16 : 8;
++   /* The CSF tilers (v10+) take 16 bytes per enabled bin from the heap: on
++    * a G615 (v11) the heap top of a 4096x4096 pass with mask 0x1fe (21845
++    * bins) moves down by DIV_ROUND_UP(21845, 8) * 8 * 16 bytes per layer.
++    * v10 is assumed to match; overestimating only drops fine levels sooner.
++    */
++   const uint32_t bin_ptr_size = PAN_ARCH >= 10 ? 16 : 8;
+ 
+    uint32_t bins_x[PAN_BIN_LEVEL_COUNT];
+    uint32_t bins_y[PAN_BIN_LEVEL_COUNT];
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 39da551b..fa500adc 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -1541,9 +1541,18 @@ get_tiler_desc(struct panvk_cmd_buffer *cmdbuf)
+       ASSERTED unsigned max_levels = tiler_features.max_levels;
+       assert(max_levels >= 2);
+ 
+-      /* The tiler chunk start with a header of 64 bytes */
++      /* The tiler chunk start with a header of 64 bytes. The tiler takes
++       * the bin pointers of all the layers of a tiler context from one heap
++       * chunk at once: if they don't fit, every new chunk the OOM handler
++       * links is too small as well, until the heap reaches its maximum and
++       * the queue group is terminated. Split the budget between the layers
++       * of a tiler context. */
++      const uint32_t td_layers =
++         CLAMP(cmdbuf->state.gfx.render.layer_count, 1,
++               MAX_LAYERS_PER_TILER_DESC);
+       cfg.hierarchy_mask = panvk_select_tiler_hierarchy_mask(
+-         phys_dev, &cmdbuf->state.gfx, phys_dev->csf.tiler.chunk_size - 64);
++         phys_dev, &cmdbuf->state.gfx,
++         (phys_dev->csf.tiler.chunk_size - 64) / td_layers);
+       cfg.fb_width = fb->width_px;
+       cfg.fb_height = fb->height_px;
+ 
+-- 
+2.55.0
+
