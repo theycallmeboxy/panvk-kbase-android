@@ -8,8 +8,14 @@ Every interpolated varying load is emitted with .store, which recomputes
 the interpolation position and writes the hidden varying state, so
 va_insert_flow makes it wait for all outstanding varying loads. A
 fragment shader reading two varyings serializes them. Within a block,
-once a load has stored the position for a sample mode, later loads with
-the same mode can use .retrieve: no recompute and no wait.
+once a load has stored the centre interpolation position, later centre
+loads can use .retrieve: no recompute and no wait.
+
+Only centre interpolation retrieves. A .retrieve load with the centroid
+or sample mode faulted the shader core with INSTR_INVALID_ENC on a
+Mali-G615 (Pseudoregalia, UE5 through DXVK: the title scene's GPU jobs
+fault and the 3D scene is missing), like the fused VAR_TEX encodings,
+which have no centroid or sample retrieve either.
 
 The pass runs on the final instruction order, after scheduling, register
 allocation and the post-RA cleanups: varying loads carry no ordering
@@ -30,14 +36,14 @@ Upstream-commit: none (upstream Mesa also emits .store on every load)
 Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
 Tested Kbase UAPI: CSF 1.21 / MediaTek
 Dependencies: none
-Validation test: blended full-screen quads reading UV + colour 2.01 -> 1.35 ms (DDK 1.26), framebuffer checksums identical with and without the pass; PanProbe 38/38. 2026-10-19: pass moved after scheduling/RA; Batman: Arkham Asylum's title and menu backgrounds (blocky noise before, correct on the stock driver and with noretrieve) now render correctly; drawbench fill 32 with UV + colour 1.65 ms (2.50 with noretrieve), drawbench 6 tests' checksums and racetest 5 modes identical to the previous build, PanProbe 38/38
+Validation test: 2026-10-26: retrieve limited to centre interpolation after Pseudoregalia (UE5, DXVK) faulted the shader core with INSTR_INVALID_ENC on centroid/sample .retrieve loads (bisected to this patch; 0 faults with BIFROST_MESA_DEBUG=noretrieve and with the fix, 2 runs; Arkham title/menu still correct); combined build rg045.so (fcfb64ae4566, rg477m/001-045): PanProbe 38/38 x2; vkd3d-proton 2.14.1 suite 306 -> 309 PASS (test_shader_eval_attribute_dxbc/dxil FAIL -> PASS), none worse; Pseudoregalia 0 GPU faults, title scene renders; Deep Rock Galactic D3D12 title 71 fps; DXVK unchanged: Hades 460 fps, Jupiter Hell tutorial 49.1 fps, Serious Sam D3D11 57.8 fps (uncapped, quietd Stock). Earlier: blended full-screen quads reading UV + colour 2.01 -> 1.35 ms (DDK 1.26), framebuffer checksums identical with and without the pass; PanProbe 38/38. 2026-10-19: pass moved after scheduling/RA; Batman: Arkham Asylum's title and menu backgrounds (blocky noise before, correct on the stock driver and with noretrieve) now render correctly; drawbench fill 32 with UV + colour 1.65 ms (2.50 with noretrieve), drawbench 6 tests' checksums and racetest 5 modes identical to the previous build, PanProbe 38/38
 Channel: compatibility, unsafe
 Generated-by: LLM
 ---
  src/panfrost/compiler/bifrost/bi_debug.c      |  1 +
  src/panfrost/compiler/bifrost/bi_debug.h      |  1 +
- .../compiler/bifrost/bifrost_compile.c        | 74 +++++++++++++++++++
- 3 files changed, 76 insertions(+)
+ .../compiler/bifrost/bifrost_compile.c        | 76 +++++++++++++++++++
+ 3 files changed, 78 insertions(+)
 
 diff --git a/src/panfrost/compiler/bifrost/bi_debug.c b/src/panfrost/compiler/bifrost/bi_debug.c
 index 6e99189..230516f 100644
@@ -64,10 +70,10 @@ index 3360e23..cf5cfe6 100644
  extern unsigned bifrost_debug;
  
 diff --git a/src/panfrost/compiler/bifrost/bifrost_compile.c b/src/panfrost/compiler/bifrost/bifrost_compile.c
-index d7adf88..15a8152 100644
+index d7adf88..e06da8b 100644
 --- a/src/panfrost/compiler/bifrost/bifrost_compile.c
 +++ b/src/panfrost/compiler/bifrost/bifrost_compile.c
-@@ -602,6 +602,72 @@ bi_emit_load_var(bi_builder *b, nir_intrinsic_instr *intr)
+@@ -602,6 +602,74 @@ bi_emit_load_var(bi_builder *b, nir_intrinsic_instr *intr)
     bi_split_def(b, &intr->def);
  }
  
@@ -108,9 +114,11 @@ index d7adf88..15a8152 100644
 +      bi_foreach_instr_in_block(block, I) {
 +         if (va_is_interp_varying_load(I) && I->update == BI_UPDATE_STORE &&
 +             I->sample != BI_SAMPLE_EXPLICIT) {
-+            if (stored && I->sample == sample &&
-+                (I->sample != BI_SAMPLE_SAMPLE ||
-+                 bi_is_equiv(I->src[0], sample_src))) {
++            /* Only centre interpolation retrieves: a .retrieve load with the
++             * centroid or sample mode faults the shader core with
++             * INSTR_INVALID_ENC on G615 (Pseudoregalia, UE5), like the fused
++             * VAR_TEX encodings, which have no centroid/sample retrieve. */
++            if (stored && I->sample == sample && sample == BI_SAMPLE_CENTER) {
 +               I->update = BI_UPDATE_RETRIEVE;
 +            } else {
 +               stored = true;
@@ -140,7 +148,7 @@ index d7adf88..15a8152 100644
  static void
  bi_emit_load_var_buf(bi_builder *b, nir_intrinsic_instr *intr)
  {
-@@ -4469,6 +4535,14 @@ bi_compile_variant_nir(nir_shader *nir,
+@@ -4469,6 +4537,14 @@ bi_compile_variant_nir(nir_shader *nir,
     bi_opt_control_flow(ctx);
  
     if (ctx->arch >= 9) {
