@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:31:45 -0400
+Subject: [PATCH] panvk/csf: don't elide barrier syncs while u_trace is
+ recording
+
+With MESA_GPU_TRACES set, the first queue wait after a barrier lost the
+device (CS_FATAL FATAL_CS_INVALID_INSTRUCTION, vkQueueWaitIdle returned
+VK_ERROR_DEVICE_LOST) on any build with barrier sync elision. Bisected on
+drawbench indep 64: builds up to and including the deferred timestamp walk
+change trace fine; the build that adds barrier sync elision and idle compute
+subqueue work faults, and every later build does. With
+PANVK_NO_SYNC_ELISION=1 the current build traces fine.
+
+u_trace brackets each barrier with begin/end markers whose timestamp
+writes run on the subqueues the barrier waits on; with elision the compute
+subqueue's waits are deferred instead of emitted, so the markers and the
+deferred waits no longer line up. Tracing is a debug path whose job is to
+show the barriers, so return false from panvk_cmd_sync_elision_enabled()
+while u_trace is enabled: traced command buffers get the plain barriers,
+untraced ones are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: debug tooling: MESA_GPU_TRACES (u_trace) no longer loses the device; barrier sync elision (rg477m/009) is turned off while u_trace is recording, untraced command buffers are unchanged
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: applies after rg477m/045; fixes the u_trace interaction of rg477m/009
+Validation test: drawbench indep 64 with MESA_GPU_TRACES=print: rg477m/001-045 FATAL_CS_INVALID_INSTRUCTION + VK_ERROR_DEVICE_LOST (bisected: 001-008 fine, 001-009 faults), with this patch runs (1.92 ms/frame); without tracing drawbench indep 64 unchanged (1.00-1.05 ms/frame both builds); rg046-compat (b85e6945ab6c, rg477m/001-046): PanProbe 38/38 x2; validate-series --build: 219 patches apply, tree identical, 0 warnings
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_cmd_buffer.h | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+index 4a321536..038cf982 100644
+--- a/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+@@ -841,6 +841,12 @@ panvk_cmd_sync_elision_enabled(const struct panvk_cmd_buffer *cmdbuf)
+    if (disabled < 0)
+       disabled = debug_get_bool_option("PANVK_NO_SYNC_ELISION", false);
+ 
++   /* Elided barriers lose the device under u_trace (its barrier and timestamp
++    * instructions don't follow the deferred compute waits). Tracing is a
++    * debug path: trace the unelided barriers. */
++   if (u_trace_enabled(cmdbuf->utrace.uts[0].utctx))
++      return false;
++
+    return !disabled && cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+ }
+ 
+-- 
+2.55.0
+
