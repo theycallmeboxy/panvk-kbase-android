@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 09:38:06 -0400
+Subject: [PATCH] panvk/csf: CSG-scope in-stream sync signals when a VkQueue is
+ one queue group
+
+On kbase every in-stream sync signal used SYSTEM scope (csf-v11/077),
+because each subqueue was its own CSG and a SYNC_WAIT on a sibling CSG is
+only woken by a SYSTEM-scope update. A SYSTEM-scope update also interrupts
+the host, so every render pass, barrier and ring-buffer release cost a GPU
+interrupt and a wakeup of the kernel and of the threads polling it.
+
+With one queue group per VkQueue (rg477m/004, the default) the subqueues
+that wait on these signals share the signalling CSG, so CSG scope is enough.
+Use it there. Signals another VkQueue may wait on (events) keep SYSTEM
+scope, as does the per-submit queue signal the host waits on, and so does
+PANVK_KBASE_ONE_GROUP=0. PANVK_SYSTEM_SCOPE_SIGNALS=1 restores the old scope.
+
+drawbench, interrupts per frame: 64 independent passes 39.7 -> 3.1,
+64 dependent passes 44 -> 3.0 (the stock Mali driver: about 2), 4-5% less
+frame time. Tomb Raider (2013) benchmark: GPU interrupts 9093 -> 914 per
+second, DXVK's queue thread 13.7% -> 4.1% of a core (stock: 4.1%), the
+wrapper's swapchain thread 11.5% -> 2.3%, same frame rate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: D3D/Vulkan CPU overhead: in-stream sync signals between the subqueues of one VkQueue use CSG scope when the VkQueue is one kbase queue group (rg477m/004 default), so they no longer raise a GPU interrupt each; signals another VkQueue may wait on (events) and the per-submit queue signal keep SYSTEM scope
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: rg477m/004 (one queue group per VkQueue); applies after rg477m/047
+Validation test: drawbench GPU interrupts per frame 39.7 -> 3.1 (independent passes), 44 -> 3.0 (dependent passes), frame time -4-5%; Tomb Raider (2013) benchmark, DXVK 1.11.1, quietd Stock, uncapped: interrupts 9093 -> 914/s, dxvk-queue thread 13.7% -> 4.1% of a core, swapchain thread 11.5% -> 2.3%, 73.4 vs 72.4 fps (same within run spread); Arkham City 10 rounds 36.5 vs 36.0 fps; PanProbe compat 38/38 x2; vkd3d-proton 2.14.1 suite 308 PASS, the one difference the known upstream test_sampler_border_color flake (B27); opt-out PANVK_SYSTEM_SCOPE_SIGNALS=1
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_instr.h        | 24 ++++++++++++++++++++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_event.c |  2 +-
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_instr.h b/src/panfrost/vulkan/csf/panvk_instr.h
+index 34d20705..56fe7916 100644
+--- a/src/panfrost/vulkan/csf/panvk_instr.h
++++ b/src/panfrost/vulkan/csf/panvk_instr.h
+@@ -91,8 +91,32 @@ void panvk_per_arch(panvk_instr_end_work_async)(
+    const struct panvk_instr_end_args *const args,
+    struct cs_async_op ts_async_op);
+ 
++/* Scope for in-stream signals that only the other subqueues of the same
++ * VkQueue wait on. On kbase each subqueue used to be its own CSG, and a
++ * SYNC_WAIT on a sibling CSG is only woken by a SYSTEM-scope update, which
++ * also interrupts the host. With one queue group per VkQueue (rg477m/004,
++ * PANVK_KBASE_ONE_GROUP, the default) the waiters share the signalling CSG,
++ * so CSG scope wakes them without an interrupt per signal.
++ * PANVK_SYSTEM_SCOPE_SIGNALS=1 restores SYSTEM scope. */
+ static inline enum mali_cs_sync_scope
+ panvk_cs_signal_scope(const struct panvk_cmd_buffer *cmdbuf)
++{
++   if (to_panvk_physical_device(cmdbuf->vk.base.device->physical)
++          ->kbase_node_path[0]) {
++      static int csg = -1;
++      if (csg < 0)
++         csg = !debug_get_bool_option("PANVK_SYSTEM_SCOPE_SIGNALS", false) &&
++               debug_get_bool_option("PANVK_KBASE_ONE_GROUP", true);
++      return csg ? MALI_CS_SYNC_SCOPE_CSG : MALI_CS_SYNC_SCOPE_SYSTEM;
++   }
++
++   return MALI_CS_SYNC_SCOPE_CSG;
++}
++
++/* Scope for signals another VkQueue (another queue group on kbase) may wait
++ * on, e.g. events: SYSTEM on kbase. */
++static inline enum mali_cs_sync_scope
++panvk_cs_signal_scope_cross_queue(const struct panvk_cmd_buffer *cmdbuf)
+ {
+    if (to_panvk_physical_device(cmdbuf->vk.base.device->physical)
+           ->kbase_node_path[0])
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
+index c648beb1..f91c92c5 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_event.c
+@@ -160,7 +160,7 @@ panvk_per_arch(CmdSetEvent2)(VkCommandBuffer commandBuffer, VkEvent _event,
+             }
+ 
+             cs_move32_to(b, seqno, 1);
+-            cs_sync32_set(b, false, panvk_cs_signal_scope(cmdbuf), seqno,
++            cs_sync32_set(b, false, panvk_cs_signal_scope_cross_queue(cmdbuf), seqno,
+                           sync_addr, cs_defer(sb_mask | SB_MASK(DEFERRED_FLUSH),
+                                               SB_ID(DEFERRED_SYNC)));
+          }
+-- 
+2.55.0
+
