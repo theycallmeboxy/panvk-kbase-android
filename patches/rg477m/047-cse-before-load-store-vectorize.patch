@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:29:14 -0400
+Subject: [PATCH] pan/bi: CSE the address arithmetic before vectorizing loads
+ and stores
+
+nir_opt_load_store_vectorize only merges accesses whose offsets have the same
+base SSA value. bifrost_postprocess_nir() runs it with nothing but copy
+propagation before it, while the lowering earlier in the pass leaves one
+copy of the address arithmetic per access: DXVK reads an instance- or
+vertex-indexed constant buffer as index * stride + 16, + 20, + 24, + 28, each
+access with its own index * stride. The four loads then have four different
+bases and stay four LD_PKA.i32 instead of one LD_PKA.i128. Later passes CSE
+the multiplications, but by then the vectorizer has run.
+
+Run constant folding, algebraic optimizations, CSE and DCE right before the
+vectorizer.
+
+Tomb Raider (2013), DXVK, all 1218 graphics shaders of its benchmark run:
+position shaders 103.8 -> 69.7 instructions and 27.4 -> 10.3 load/store
+cycles on average, varying shaders 153.6 -> 112.0 and 39.4 -> 19.7,
+fragment shaders 150.7 -> 148.5 and 15.9 -> 14.7. In the
+disassembly 90% of the 32-bit UBO loads shared a 16-byte slot with another
+load from the same base. Built-in benchmark 68.4 -> 74.0 / 74.3 fps
+(stock Mali driver 71.8).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QAYrqSPd4TgpVaKLqz5cYR
+
+Purpose: D3D performance: constant-buffer loads in DXVK/vkd3d shaders are vectorized (LD_PKA.i128 instead of four LD_PKA.i32); the load/store vectorizer only merges accesses with the same base SSA value and ran before the duplicated address arithmetic was CSE'd
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: applies after rg477m/046
+Validation test: Tomb Raider (2013) built-in benchmark, DXVK 1.11.1, quietd Stock, uncapped, interleaved A C C A A C with the change env-gated in one build: 68.4 / 68.3 / 68.4 -> 74.0 / 74.3 / 73.8 fps (stock Mali driver 71.6 / 71.9); shader stats over its 1218 graphics shaders: position 27.4 -> 10.3 load/store cycles, varying 39.4 -> 19.7, fragment 15.9 -> 14.7; installed packages rg477m/001-047 compat a85fcca37a47 / unsafe 931e630faaba: Tomb Raider 74.5 / 73.3 fps; PanProbe compat 38/38 x2, unsafe 37/38 x2 (bc_decode by design); vkd3d-proton 2.14.1 suite 309 PASS, every test the same result as rg477m/001-045; 16-game boot sweep: every game in its known state, no GPU faults; gameplay A/B vs 001-046 compat (quietd Stock, uncapped): Hades hub 229.4 -> 228.0 fps (-0.6%), Jupiter Hell tutorial 47.7 -> 48.3, Risk of Rain 2 stage 1 27.1 -> 28.0 (map spread +-3), Serious Sam D3D11 bot benchmark 57.6 -> 57.3; DRG -dx12 renders (71 fps title)
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/compiler/bifrost/bifrost_nir.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/panfrost/compiler/bifrost/bifrost_nir.c b/src/panfrost/compiler/bifrost/bifrost_nir.c
+index 4cab1dfa..fce2cd76 100644
+--- a/src/panfrost/compiler/bifrost/bifrost_nir.c
++++ b/src/panfrost/compiler/bifrost/bifrost_nir.c
+@@ -1121,6 +1121,16 @@ bifrost_postprocess_nir(nir_shader *nir,
+    if (!(inputs->robust_modes & nir_var_mem_ssbo))
+       vectorize_opts.modes |= nir_var_mem_ssbo;
+ 
++   /* The vectorizer only merges accesses whose offsets share a base SSA value.
++    * By now the lowering above has left one copy of the address arithmetic per
++    * access (each DXVK constant-buffer read computes its own index * stride),
++    * so contiguous scalar UBO loads would stay separate LD_PKA.i32. CSE first.
++    */
++   NIR_PASS(_, nir, nir_opt_constant_folding);
++   NIR_PASS(_, nir, nir_opt_algebraic);
++   NIR_PASS(_, nir, nir_opt_cse);
++   NIR_PASS(_, nir, nir_opt_dce);
++
+    NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vectorize_opts);
+ 
+    /* Our OpenCL compiler (src/panfrost/clc/pan_compile.c) has a very weird and
+-- 
+2.55.0
+
