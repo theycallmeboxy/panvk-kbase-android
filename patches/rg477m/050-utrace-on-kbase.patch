@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Fri, 30 Oct 2026 00:43:35 -0400
+Subject: [PATCH] panvk/csf: process u_trace timestamps on kbase
+
+u_trace (MESA_GPU_TRACES=print/perfetto) records GPU timestamps around
+render passes, dispatches, barriers and syncs. The kbase backend forced
+process_utrace off: the reader waits for the timestamps on the queue's
+DRM timeline syncobj, which kbase doesn't have, so tracing recorded
+nothing.
+
+On kbase, give the first flush data of each traced submission its own
+binary sync, armed after the submit ioctl on the submission's subqueue
+sequence numbers (the same targets the submit's own signals use), or
+signalled at once if the submit fails so the reader never waits forever.
+The reader destroys the sync after waiting; deleting unread flush data
+destroys it too. Then process the flushed events as the DRM path does.
+
+Nothing changes with tracing off: process_utrace stays false and the new
+code returns at its first check.
+
+Purpose: debugging: per-render-pass / per-dispatch GPU timestamps on kbase (MESA_GPU_TRACES); on kbase the first flush of each traced submission gets its own binary sync armed on the submission's subqueue sequence numbers, instead of the DRM timeline syncobj kbase lacks
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: applies after rg477m/049; tracing itself needs rg477m/046 (B25)
+Validation test: test build utk (same code): drawbench indep/passes 64 with MESA_GPU_TRACES=print write 1.7 M / 2.2 M trace lines with real timestamps (001-049 records none); tracing off costs nothing (drawbench indep 64, 5 interleaved rounds, 1.017-1.024 vs 1.020-1.050 ms/frame); PanProbe 38/38 x2; traced games run (Portal 2 139 fps traced vs 174, Gladius 43.8 traced); gameplay sweep untraced in range of 001-049: Portal 2 173.8/164.4, Megabonk 72.0, Moonlighter 134.2, ROLLERDROME 91.7, Fallout NV 27.2, Tomb Raider benchmark 74.7, no GPU faults
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c | 54 ++++++++++++++++++--
+ src/panfrost/vulkan/panvk_utrace.c           |  7 +++
+ src/panfrost/vulkan/panvk_utrace.h           |  2 +
+ 3 files changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+index a7031518..d209db01 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+@@ -2552,11 +2552,6 @@ panvk_queue_submit_init(struct panvk_queue_submit *submit,
+    submit->process_utrace =
+       u_trace_should_process(&submit->dev->utrace.utctx) &&
+       submit->phys_dev->kmod.dev->props.timestamp_frequency;
+-#ifdef HAVE_PAN_KMOD_KBASE
+-   if (gpu_queue_uses_kbase(submit->dev))
+-      submit->process_utrace = false;
+-#endif
+-
+    submit->force_sync = PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
+ }
+ 
+@@ -2729,6 +2724,25 @@ panvk_queue_submit_init_utrace(struct panvk_queue_submit *submit,
+          .free_self = false,
+       };
+    }
++
++#ifdef HAVE_PAN_KMOD_KBASE
++   /* kbase has no DRM timeline syncobj to wait on: the first flush data gets
++    * its own binary sync, armed on this submission's subqueue sequence
++    * numbers once it is submitted (panvk_queue_submit_utrace_kbase()). */
++   if (gpu_queue_uses_kbase(submit->dev)) {
++      struct panvk_utrace_flush_data *first =
++         submit->utrace.data[submit->utrace.first_subqueue];
++      struct vk_sync *sync = NULL;
++
++      if (vk_sync_create(&submit->dev->vk,
++                         &submit->phys_dev->drm_syncobj_type, 0, 0,
++                         &sync) == VK_SUCCESS) {
++         first->sync = sync;
++         first->wait_value = 0;
++         first->own_sync = true;
++      }
++   }
++#endif
+ }
+ 
+ static void
+@@ -3157,6 +3171,35 @@ panvk_queue_submit_ioctl_kbase(struct panvk_queue_submit *submit,
+    return VK_SUCCESS;
+ }
+ 
++static void
++panvk_queue_submit_utrace_kbase(struct panvk_queue_submit *submit, bool ok)
++{
++   if (!submit->utrace.queue_mask)
++      return;
++
++   struct panvk_utrace_flush_data *first =
++      submit->utrace.data[submit->utrace.first_subqueue];
++
++   if (first->own_sync && first->sync) {
++      if (ok) {
++         uint64_t addrs[PANVK_KBASE_SYNC_TARGET_COUNT] = {0};
++
++         for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
++            addrs[i] = kbase_subqueue_seqno_dev_addr(submit->queue, i);
++
++         panvk_kbase_sync_set_pending(first->sync, submit->queue,
++                                      kbase_wait_sync_targets,
++                                      submit->kbase_target_seqnos, addrs);
++      } else {
++         /* Nothing was submitted: don't let the reader wait forever. */
++         vk_sync_signal(&submit->dev->vk, first->sync, 0);
++      }
++   }
++
++   /* process flushed events after the sync is set up */
++   u_trace_context_process(&submit->dev->utrace.utctx, false);
++}
++
+ static void
+ panvk_queue_submit_process_signals_kbase(struct panvk_queue_submit *submit,
+                                          const struct vk_queue_submit *vk_submit)
+@@ -3349,6 +3392,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+ #ifdef HAVE_PAN_KMOD_KBASE
+    if (gpu_queue_uses_kbase(submit.dev)) {
+       result = panvk_queue_submit_ioctl_kbase(&submit, vk_submit);
++      panvk_queue_submit_utrace_kbase(&submit, result == VK_SUCCESS);
+       if (result != VK_SUCCESS)
+          goto out;
+ 
+diff --git a/src/panfrost/vulkan/panvk_utrace.c b/src/panfrost/vulkan/panvk_utrace.c
+index 9c0442d3..df9c4913 100644
+--- a/src/panfrost/vulkan/panvk_utrace.c
++++ b/src/panfrost/vulkan/panvk_utrace.c
+@@ -102,6 +102,8 @@ panvk_utrace_read_ts(struct u_trace_context *utctx, void *timestamps,
+                        VK_SYNC_WAIT_COMPLETE, UINT64_MAX) != VK_SUCCESS)
+          mesa_logw("failed to wait for utrace timestamps");
+ 
++      if (data->own_sync)
++         vk_sync_destroy(&dev->vk, data->sync);
+       data->sync = NULL;
+       data->wait_value = 0;
+    }
+@@ -136,6 +138,11 @@ panvk_utrace_delete_flush_data(struct u_trace_context *utctx, void *flush_data)
+ {
+    struct panvk_utrace_flush_data *data = flush_data;
+ 
++   if (data->own_sync && data->sync) {
++      vk_sync_destroy(&to_dev(utctx)->vk, data->sync);
++      data->sync = NULL;
++   }
++
+    util_dynarray_foreach(&data->clone_cs_bufs, struct panvk_utrace_buf *, buf)
+       panvk_utrace_delete_buffer(utctx, *buf);
+    util_dynarray_fini(&data->clone_cs_bufs);
+diff --git a/src/panfrost/vulkan/panvk_utrace.h b/src/panfrost/vulkan/panvk_utrace.h
+index 1922cda3..a72d6ad9 100644
+--- a/src/panfrost/vulkan/panvk_utrace.h
++++ b/src/panfrost/vulkan/panvk_utrace.h
+@@ -21,6 +21,8 @@ struct panvk_utrace_flush_data {
+ 
+    struct vk_sync *sync;
+    uint64_t wait_value;
++   /* kbase: sync is a per-submit binary sync owned by this flush data. */
++   bool own_sync;
+ 
+    struct util_dynarray clone_cs_bufs;
+    bool free_self;
+-- 
+2.55.0
+
