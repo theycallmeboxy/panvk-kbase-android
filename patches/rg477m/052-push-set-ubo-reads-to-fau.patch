@@ -1,0 +1,384 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: theycallmeboxy <82409831+theycallmeboxy@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 04:01:30 -0400
+Subject: [PATCH] panvk/csf: push constant-offset reads of descriptor-set UBOs
+ of fragment shaders to the FAU
+
+rg477m/049 pushes constant-offset reads of dynamic uniform buffers (DXVK's
+constant buffers, resource table 0) to the FAU. Native Vulkan and Zink bind
+their constants as plain uniform buffers in descriptor sets (tables 1 and
+up), whose reads stayed LD_PKA loads through the load/store unit.
+
+The driver now offers the compiler a fragment shader's constant handles of
+single, non-update-after-bind UNIFORM_BUFFER bindings (up to 16;
+pan_compile_inputs.fau.pushable_set_ubos). bi_opt_push_ubo pushes their
+constant-offset reads like table-0 UBOs, naming them UBO
+PAN_SET_UBO_ID_BASE + i in the relocations, and now also runs when only
+such UBOs are pushable. At each draw the command stream copies the pushed
+words from the buffer named by the bound set's host descriptor copy
+(a BUFFER descriptor); a set without update-after-bind can't change while a
+command buffer uses it, and the copy runs when the draw executes, like the
+loads it replaces. Descriptor lowering builds handles from table and index,
+so they are constant-folded before the collection.
+
+PANVK_NO_SET_UBO_PUSH=1 keeps those reads as loads.
+
+Purpose: performance: constant-offset reads of plain descriptor-set uniform buffers in fragment shaders (native Vulkan, Zink) become FAU uniform reads instead of LD_PKA loads, as rg477m/049 does for dynamic UBOs; the command stream copies the pushed words from the buffer named by the bound set's descriptor at draw time
+Upstream-commit: none
+Tested GPU: Mali-G615 MC6 (Anbernic RG477M, Dimensity 8300, v11)
+Tested Kbase UAPI: CSF 1.21 / MediaTek
+Dependencies: applies after rg477m/051 (extends rg477m/049)
+Validation test: test build setubo (same code): PanProbe 38/38 x2; Gladius fragment shaders' load/store cycles 120 -> 4 (shaderdb), no shader left at one thread, rendering correct, fps unchanged (on 42.9/44.0/39.9, off 44.0/39.8/43.9); Jupiter Hell (GL via Zink) tutorial on 49.4/50.2 vs off 47.7/48.6 fps (+3.5%); Hades uncapped on 204.9 vs off 206.6 mean of 5 each (noise); vkd3d-proton 2.14.1 suite same as 001-051 except test_sampler_border_color (B27, intermittent: 20 repeats each 7 failures on both 001-051 and this build); gameplay sweep in range: Portal 2 171.4/170.7, Megabonk 69.7, Moonlighter 132.2, ROLLERDROME 91.5, Fallout NV 19.6, Tomb Raider benchmark 74.4, no GPU faults; 16-game boot sweep every game in its known state, no GPU faults; opt-out PANVK_NO_SET_UBO_PUSH=1
+Channel: compatibility, unsafe
+Generated-by: LLM
+---
+ .../compiler/bifrost/bi_opt_push_ubo.c        |  40 +++++--
+ .../compiler/bifrost/bifrost_compile.c        |   7 +-
+ src/panfrost/compiler/pan_compiler.h          |   9 ++
+ src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c   |  27 ++++-
+ src/panfrost/vulkan/panvk_shader.h            |   4 +
+ src/panfrost/vulkan/panvk_vX_shader.c         | 105 +++++++++++++++++-
+ 6 files changed, 175 insertions(+), 17 deletions(-)
+
+diff --git a/src/panfrost/compiler/bifrost/bi_opt_push_ubo.c b/src/panfrost/compiler/bifrost/bi_opt_push_ubo.c
+index 229b5edc..d5f2ed3e 100644
+--- a/src/panfrost/compiler/bifrost/bi_opt_push_ubo.c
++++ b/src/panfrost/compiler/bifrost/bi_opt_push_ubo.c
+@@ -18,6 +18,27 @@ bi_is_ubo(bi_instr *ins)
+           (ins->seg == BI_SEG_UBO);
+ }
+ 
++/* The id under which the analysis and the relocations know a pushable UBO:
++ * its resource table 0 index (pushable_ubos), or PAN_SET_UBO_ID_BASE + i for
++ * the i-th handle of pushable_set_ubos. -1 if loads from it can't be pushed. */
++static int
++bi_pushable_ubo_id(bi_context *ctx, uint32_t handle)
++{
++   unsigned ubo = pan_res_handle_get_index(handle);
++
++   if (pan_res_handle_get_table(handle) == 0)
++      return ubo < 32 && ctx->inputs->fau.pushable_ubos & BITFIELD_BIT(ubo)
++                ? ubo
++                : -1;
++
++   for (unsigned i = 0; i < ctx->inputs->fau.pushable_set_ubo_count; i++) {
++      if (ctx->inputs->fau.pushable_set_ubos[i] == handle)
++         return PAN_SET_UBO_ID_BASE + i;
++   }
++
++   return -1;
++}
++
+ static bool
+ bi_is_pushable_ubo(bi_context *ctx, bi_instr *ins)
+ {
+@@ -25,12 +46,9 @@ bi_is_pushable_ubo(bi_context *ctx, bi_instr *ins)
+          (ins->src[1].type == BI_INDEX_CONSTANT)))
+       return false;
+ 
+-   unsigned ubo = pan_res_handle_get_index(ins->src[1].value);
+    unsigned offset = ins->src[0].value;
+ 
+-   /* pushable_ubos indexes resource table 0, where the UBOs are. */
+-   return pan_res_handle_get_table(ins->src[1].value) == 0 && ubo < 32 &&
+-          ctx->inputs->fau.pushable_ubos & BITFIELD_BIT(ubo) &&
++   return bi_pushable_ubo_id(ctx, ins->src[1].value) >= 0 &&
+           (offset & 0x3) == 0;
+ }
+ 
+@@ -57,13 +75,18 @@ bi_analyze_ranges(bi_context *ctx)
+                         util_last_bit(ctx->inputs->fau.pushable_ubos)),
+    };
+ 
++   if (ctx->inputs->fau.pushable_set_ubo_count)
++      res.nr_blocks = MAX2(res.nr_blocks,
++                           PAN_SET_UBO_ID_BASE +
++                              ctx->inputs->fau.pushable_set_ubo_count);
++
+    res.blocks = calloc(res.nr_blocks, sizeof(struct bi_ubo_block));
+ 
+    bi_foreach_instr_global(ctx, ins) {
+       if (!bi_is_pushable_ubo(ctx, ins))
+          continue;
+ 
+-      unsigned ubo = pan_res_handle_get_index(ins->src[1].value);
++      unsigned ubo = bi_pushable_ubo_id(ctx, ins->src[1].value);
+       unsigned word = ins->src[0].value / 4;
+       unsigned channels = bi_get_opcode_props(ins)->sr_count;
+ 
+@@ -184,8 +207,9 @@ bi_opt_push_ubo(bi_context *ctx)
+       }
+ 
+       /* Check if we decided to push this */
+-      assert(ubo < analysis.nr_blocks);
+-      if (!BITSET_TEST(analysis.blocks[ubo].pushed, offset / 4)) {
++      unsigned id = bi_pushable_ubo_id(ctx, ins->src[1].value);
++      assert(id < analysis.nr_blocks);
++      if (!BITSET_TEST(analysis.blocks[id].pushed, offset / 4)) {
+          ctx->ubo_mask |= BITSET_BIT(ubo);
+          continue;
+       }
+@@ -199,7 +223,7 @@ bi_opt_push_ubo(bi_context *ctx)
+       bi_foreach_src(vec, w) {
+          /* FAU is grouped in pairs (2 x 4-byte) */
+          unsigned base =
+-            pan_lookup_pushed_ubo(ctx->info.fau, ubo, (offset + 4 * w));
++            pan_lookup_pushed_ubo(ctx->info.fau, id, (offset + 4 * w));
+ 
+          unsigned fau_idx = (base >> 1);
+          unsigned fau_hi = (base & 1);
+diff --git a/src/panfrost/compiler/bifrost/bifrost_compile.c b/src/panfrost/compiler/bifrost/bifrost_compile.c
+index 5b954401..c60b0017 100644
+--- a/src/panfrost/compiler/bifrost/bifrost_compile.c
++++ b/src/panfrost/compiler/bifrost/bifrost_compile.c
+@@ -4434,7 +4434,10 @@ bi_compile_variant_nir(nir_shader *nir,
+    }
+ 
+    /* Runs before copy prop */
+-   if (optimize && ctx->inputs->fau.pushable_ubos) {
++   const bool push_ubos = ctx->inputs->fau.pushable_ubos ||
++                          ctx->inputs->fau.pushable_set_ubo_count;
++
++   if (optimize && push_ubos) {
+       bi_opt_push_ubo(ctx);
+    }
+ 
+@@ -4459,7 +4462,7 @@ bi_compile_variant_nir(nir_shader *nir,
+       bi_opt_dce(ctx, false);
+       bi_opt_cse(ctx);
+       bi_opt_dce(ctx, false);
+-      if (ctx->inputs->fau.pushable_ubos)
++      if (push_ubos)
+          bi_opt_reorder_push(ctx);
+       bi_validate(ctx, "Optimization passes");
+    }
+diff --git a/src/panfrost/compiler/pan_compiler.h b/src/panfrost/compiler/pan_compiler.h
+index 6fa58d3e..2d7492a0 100644
+--- a/src/panfrost/compiler/pan_compiler.h
++++ b/src/panfrost/compiler/pan_compiler.h
+@@ -31,6 +31,11 @@ pan_get_nir_shader_compiler_options(unsigned arch,
+                                     mesa_shader_stage stage,
+                                     bool merge_wg);
+ 
++/* UBOs outside resource table 0 that the driver lets the compiler push:
++ * relocations name the i-th one PAN_SET_UBO_ID_BASE + i. */
++#define PAN_MAX_PUSHABLE_SET_UBOS 16
++#define PAN_SET_UBO_ID_BASE       32
++
+ /* Inputs to the backend compiler */
+ struct pan_compile_inputs {
+    uint64_t gpu_id;
+@@ -62,6 +67,10 @@ struct pan_compile_inputs {
+       uint32_t reserved;
+       /* Mask of UBOs that may be moved to push constants */
+       uint32_t pushable_ubos;
++      /* Resource handles of further UBOs (tables other than 0) whose
++       * constant-offset reads may be pushed too. */
++      uint32_t pushable_set_ubos[PAN_MAX_PUSHABLE_SET_UBOS];
++      uint32_t pushable_set_ubo_count;
+       /* The driver has no sysval UBO holding blend constants (PanVK): don't
+        * reserve the first pushed words of UBO 1 for them. */
+       bool no_blend_const_ubo;
+diff --git a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+index 3a74181d..fbaeb4e2 100644
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -3080,8 +3080,31 @@ copy_pushed_ubos(struct panvk_cmd_buffer *cmdbuf,
+       uint32_t size = 0;
+       const uint32_t idx = reloc.ubo - desc_info->dyn_bufs_start;
+ 
+-      if (reloc.ubo >= desc_info->dyn_bufs_start &&
+-          idx < desc_info->dyn_bufs.count) {
++      if (reloc.ubo >= PAN_SET_UBO_ID_BASE) {
++         /* A plain UBO of a descriptor set: its buffer descriptor (address,
++          * size) is in the bound set's host copy, which can't change while
++          * this command buffer uses the set (no update-after-bind). */
++         const uint32_t k = reloc.ubo - PAN_SET_UBO_ID_BASE;
++
++         if (k < desc_info->pushable_set_ubo_count) {
++            const uint32_t handle = desc_info->pushable_set_ubos[k];
++            const uint32_t set_idx = pan_res_handle_get_table(handle) - 1;
++            const uint32_t desc_idx = pan_res_handle_get_index(handle);
++            const struct panvk_descriptor_set *set =
++               set_idx < MAX_SETS ? desc_state->sets[set_idx] : NULL;
++
++            if (set && set->descs.host && desc_idx < set->desc_count) {
++               const struct mali_buffer_packed *desc =
++                  (const void *)((const uint8_t *)set->descs.host +
++                                 desc_idx * PANVK_DESCRIPTOR_SIZE);
++
++               pan_unpack(desc, BUFFER, buf);
++               addr = buf.address;
++               size = buf.size;
++            }
++         }
++      } else if (reloc.ubo >= desc_info->dyn_bufs_start &&
++                 idx < desc_info->dyn_bufs.count) {
+          const uint32_t src_handle = desc_info->dyn_bufs.map[idx];
+          const uint32_t set_idx = COPY_DESC_HANDLE_EXTRACT_TABLE(src_handle);
+          const uint32_t dyn_buf_idx =
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index 147350df..b424e288 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -414,6 +414,10 @@ struct panvk_shader_desc_info {
+    /* Resource table 0 indices of the dynamic uniform buffers, the UBOs whose
+     * constant-offset reads the compiler may move to the FAU. */
+    uint32_t pushable_ubos;
++   /* Resource handles of plain descriptor-set UBOs the compiler may push as
++    * well: relocation UBO PAN_SET_UBO_ID_BASE + i is pushable_set_ubos[i]. */
++   uint32_t pushable_set_ubos[PAN_MAX_PUSHABLE_SET_UBOS];
++   uint32_t pushable_set_ubo_count;
+    uint32_t fs_varying_attr_desc_count;
+ #endif
+ };
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 1a9290cf..0f6a240e 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -2992,20 +2992,108 @@ shader_accesses_memory(nir_shader *nir)
+  * Fragment shaders only: a D3D9 vertex shader pushes dozens of vec4s, and
+  * copying them for every draw costs more command-stream time than the loads
+  * it saves (Portal 2 184 -> 150 fps, Tomb Raider 74.9 -> 71.5).
+- * PANVK_NO_UBO_PUSH=1 keeps them as loads. */
++ * PANVK_NO_UBO_PUSH=1 keeps them as loads.
++ *
++ * Plain uniform buffers in descriptor sets (native Vulkan games bind their
++ * constants that way) are pushed the same way: a fragment shader's constant
++ * handles of single, non-update-after-bind UNIFORM_BUFFER bindings are offered
++ * to the compiler, and the command stream reads their address from the bound
++ * set when it records the draw (a set without update-after-bind can't change
++ * while a command buffer uses it). PANVK_NO_SET_UBO_PUSH=1 keeps those loads. */
+ static void
+-panvk_set_pushable_ubos(struct pan_compile_inputs *inputs,
+-                        const struct panvk_shader_desc_info *desc_info)
++panvk_collect_pushable_set_ubos(nir_shader *nir, uint32_t set_layout_count,
++                                struct vk_descriptor_set_layout *const *set_layouts,
++                                struct panvk_shader_desc_info *desc_info)
+ {
+ #if PAN_ARCH >= 9
+-   static int disabled = -1;
++   desc_info->pushable_set_ubo_count = 0;
++
++   /* Descriptor lowering builds the handles from table and index; fold them
++    * so the constant ones can be recognized. */
++   NIR_PASS(_, nir, nir_opt_constant_folding);
++
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_load_ubo)
++               continue;
++            if (!nir_src_is_const(intr->src[0]))
++               continue;
++
++            const uint32_t handle = nir_src_as_uint(intr->src[0]);
++            const uint32_t table = pan_res_handle_get_table(handle);
++            const uint32_t index = pan_res_handle_get_index(handle);
++
++            if (table == 0 || table - 1 >= set_layout_count ||
++                !set_layouts[table - 1])
++               continue;
++
++            const struct panvk_descriptor_set_layout *layout =
++               to_panvk_descriptor_set_layout(set_layouts[table - 1]);
++            bool eligible = false;
++
++            for (uint32_t b = 0; b < layout->binding_count; b++) {
++               const struct panvk_descriptor_set_binding_layout *bl =
++                  &layout->bindings[b];
++
++               if (bl->desc_idx == index &&
++                   bl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
++                   bl->desc_count == 1 &&
++                   !(bl->flags &
++                     VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT)) {
++                  eligible = true;
++                  break;
++               }
++            }
++
++            if (!eligible)
++               continue;
++
++            bool known = false;
++            for (uint32_t i = 0; i < desc_info->pushable_set_ubo_count; i++)
++               known |= desc_info->pushable_set_ubos[i] == handle;
++
++            if (!known &&
++                desc_info->pushable_set_ubo_count < PAN_MAX_PUSHABLE_SET_UBOS)
++               desc_info->pushable_set_ubos
++                  [desc_info->pushable_set_ubo_count++] = handle;
++         }
++      }
++   }
++#endif
++}
++
++static void
++panvk_set_pushable_ubos(struct pan_compile_inputs *inputs, nir_shader *nir,
++                        uint32_t set_layout_count,
++                        struct vk_descriptor_set_layout *const *set_layouts,
++                        struct panvk_shader_desc_info *desc_info)
++{
++#if PAN_ARCH >= 9
++   static int disabled = -1, set_disabled = -1;
+ 
+    if (disabled < 0)
+       disabled = debug_get_bool_option("PANVK_NO_UBO_PUSH", false);
++   if (set_disabled < 0)
++      set_disabled = debug_get_bool_option("PANVK_NO_SET_UBO_PUSH", false);
++
++   desc_info->pushable_set_ubo_count = 0;
+ 
+    if (!disabled) {
+       inputs->fau.pushable_ubos = desc_info->pushable_ubos;
+       inputs->fau.no_blend_const_ubo = true;
++
++      if (!set_disabled) {
++         panvk_collect_pushable_set_ubos(nir, set_layout_count, set_layouts,
++                                         desc_info);
++         memcpy(inputs->fau.pushable_set_ubos, desc_info->pushable_set_ubos,
++                sizeof(desc_info->pushable_set_ubos));
++         inputs->fau.pushable_set_ubo_count = desc_info->pushable_set_ubo_count;
++      }
+    }
+ #endif
+ }
+@@ -3950,7 +4038,8 @@ panvk_compile_shader(struct panvk_device *dev,
+ 
+       variant->own_bin = true;
+ 
+-      panvk_set_pushable_ubos(&inputs, &shader->desc_info);
++      panvk_set_pushable_ubos(&inputs, nir, info->set_layout_count,
++                              info->set_layouts, &shader->desc_info);
+ 
+       result = panvk_compile_nir(dev, nir, info->flags, &inputs, state,
+                                  noperspective_varyings,
+@@ -4250,6 +4339,9 @@ shader_desc_info_deserialize(struct panvk_device *dev,
+                       shader->desc_info.dyn_bufs.count);
+    shader->desc_info.dyn_bufs_start = blob_read_uint32(blob);
+    shader->desc_info.pushable_ubos = blob_read_uint32(blob);
++   shader->desc_info.pushable_set_ubo_count = blob_read_uint32(blob);
++   blob_copy_bytes(blob, shader->desc_info.pushable_set_ubos,
++                   sizeof(shader->desc_info.pushable_set_ubos));
+    shader->desc_info.fs_varying_attr_desc_count = blob_read_uint32(blob);
+ #endif
+ 
+@@ -4439,6 +4531,9 @@ shader_desc_info_serialize(struct blob *blob,
+                        shader->desc_info.dyn_bufs.count);
+    blob_write_uint32(blob, shader->desc_info.dyn_bufs_start);
+    blob_write_uint32(blob, shader->desc_info.pushable_ubos);
++   blob_write_uint32(blob, shader->desc_info.pushable_set_ubo_count);
++   blob_write_bytes(blob, shader->desc_info.pushable_set_ubos,
++                    sizeof(shader->desc_info.pushable_set_ubos));
+    blob_write_uint32(blob, shader->desc_info.fs_varying_attr_desc_count);
+ #endif
+ }
+-- 
+2.55.0
+
